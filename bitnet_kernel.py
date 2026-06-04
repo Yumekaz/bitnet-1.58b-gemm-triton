@@ -18,6 +18,7 @@ def _bitnet_fused_gemm_kernel(
     BLOCK_M: tl.constexpr,
     BLOCK_N: tl.constexpr,
     BLOCK_K: tl.constexpr,
+    BLOCK_K_PACKED: tl.constexpr,
 ):
     """
     Fused Triton Kernel for BitNet 1.58b:
@@ -81,42 +82,91 @@ def _bitnet_fused_gemm_kernel(
     # Accumulator tile for GEMM (stored in registers as float32 for high precision)
     acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
     
-    for k_idx in range(0, tl.cdiv(K, BLOCK_K)):
-        offs_k = k_idx * BLOCK_K + tl.arange(0, BLOCK_K)
+    # Weight K dimension is packed by 4
+    K_PACKED = tl.cdiv(K, 4)
+
+    for k_idx in range(0, tl.cdiv(K_PACKED, BLOCK_K_PACKED)):
+        # Compute packed K offsets
+        offs_k_packed = k_idx * BLOCK_K_PACKED + tl.arange(0, BLOCK_K_PACKED)
 
         # ---------------------------------------------------------
-        # A. Load X tile and perform fused RMSNorm & quantization
+        # A. Load X tiles and perform Fused RMSNorm & Quantization
         # ---------------------------------------------------------
-        x_offsets = offs_m[:, None] * stride_xm + offs_k[None, :] * stride_xk
-        mask_x = (offs_m[:, None] < M) & (offs_k[None, :] < K)
-        x_tile = tl.load(x_ptr + x_offsets, mask=mask_x, other=0.0).to(tl.float32)
+        # We load 4 sub-tiles of X corresponding to the 4 packed channels in W.
+        # This keeps the GEMM memory layout linear.
+        k_base = k_idx * BLOCK_K_PACKED * 4
+        cols = tl.arange(0, BLOCK_K_PACKED)
+
+        x0_offs = offs_m[:, None] * stride_xm + (k_base + cols[None, :] * 4 + 0) * stride_xk
+        x1_offs = offs_m[:, None] * stride_xm + (k_base + cols[None, :] * 4 + 1) * stride_xk
+        x2_offs = offs_m[:, None] * stride_xm + (k_base + cols[None, :] * 4 + 2) * stride_xk
+        x3_offs = offs_m[:, None] * stride_xm + (k_base + cols[None, :] * 4 + 3) * stride_xk
+
+        mask_x0 = (offs_m[:, None] < M) & ((k_base + cols[None, :] * 4 + 0) < K)
+        mask_x1 = (offs_m[:, None] < M) & ((k_base + cols[None, :] * 4 + 1) < K)
+        mask_x2 = (offs_m[:, None] < M) & ((k_base + cols[None, :] * 4 + 2) < K)
+        mask_x3 = (offs_m[:, None] < M) & ((k_base + cols[None, :] * 4 + 3) < K)
+
+        x0 = tl.load(x_ptr + x0_offs, mask=mask_x0, other=0.0).to(tl.float32)
+        x1 = tl.load(x_ptr + x1_offs, mask=mask_x1, other=0.0).to(tl.float32)
+        x2 = tl.load(x_ptr + x2_offs, mask=mask_x2, other=0.0).to(tl.float32)
+        x3 = tl.load(x_ptr + x3_offs, mask=mask_x3, other=0.0).to(tl.float32)
 
         # Apply RMSNorm and quantize into integer-valued fp16 tiles:
         # x_quant = round( (x / rms) * quant_scale )
         # Divide by rms and multiply by scale using row broadcasting
-        x_scaled = (x_tile / rms[:, None]) * quant_scale[:, None]
-        x_q = tl.where(
-            x_scaled >= 0.0,
-            tl.floor(x_scaled + 0.5),
-            tl.ceil(x_scaled - 0.5),
-        ).to(tl.float16)
-        
-        # ---------------------------------------------------------
-        # B. Load packed weights and unpack a logical BLOCK_K tile
-        # ---------------------------------------------------------
-        packed_k = offs_k // 4
-        bit_shifts = (offs_k % 4) * 2
-        w_offs = offs_n[:, None] * stride_wn + packed_k[None, :] * stride_wk
-        mask_w = (offs_n[:, None] < N) & (offs_k[None, :] < K)
+        x0_scaled = (x0 / rms[:, None]) * quant_scale[:, None]
+        x1_scaled = (x1 / rms[:, None]) * quant_scale[:, None]
+        x2_scaled = (x2 / rms[:, None]) * quant_scale[:, None]
+        x3_scaled = (x3 / rms[:, None]) * quant_scale[:, None]
 
-        packed_w = tl.load(w_ptr + w_offs, mask=mask_w, other=0).to(tl.int32) & 0xFF
-        w_tile = (((packed_w >> bit_shifts[None, :]) & 3) - 1).to(tl.float16)
+        x0_q = tl.where(
+            x0_scaled >= 0.0,
+            tl.floor(x0_scaled + 0.5),
+            tl.ceil(x0_scaled - 0.5),
+        ).to(tl.float16)
+        x1_q = tl.where(
+            x1_scaled >= 0.0,
+            tl.floor(x1_scaled + 0.5),
+            tl.ceil(x1_scaled - 0.5),
+        ).to(tl.float16)
+        x2_q = tl.where(
+            x2_scaled >= 0.0,
+            tl.floor(x2_scaled + 0.5),
+            tl.ceil(x2_scaled - 0.5),
+        ).to(tl.float16)
+        x3_q = tl.where(
+            x3_scaled >= 0.0,
+            tl.floor(x3_scaled + 0.5),
+            tl.ceil(x3_scaled - 0.5),
+        ).to(tl.float16)
+
+        # ---------------------------------------------------------
+        # B. Load Packed Weights & Unpack in SRAM
+        # ---------------------------------------------------------
+        # W has shape (N, K_PACKED)
+        w_offs = offs_n[:, None] * stride_wn + offs_k_packed[None, :] * stride_wk
+        mask_w = (offs_n[:, None] < N) & (offs_k_packed[None, :] < K_PACKED)
+
+        # Load int8 packed weights
+        packed_w = tl.load(w_ptr + w_offs, mask=mask_w, other=0)
+
+        # Unpack 2-bit weights to {-1, 0, 1}
+        # w = ((packed_w >> shift) & 0b11) - 1
+        w0 = (((packed_w >> 0) & 3) - 1).to(tl.float16)
+        w1 = (((packed_w >> 2) & 3) - 1).to(tl.float16)
+        w2 = (((packed_w >> 4) & 3) - 1).to(tl.float16)
+        w3 = (((packed_w >> 6) & 3) - 1).to(tl.float16)
         
         # ---------------------------------------------------------
         # C. Compute Matrix Multiplication (GEMM)
         # ---------------------------------------------------------
         # Accumulate: acc += X_quant @ W_unpacked.T
-        acc += tl.dot(x_q, tl.trans(w_tile))
+        # Transpose w0, w1, w2, w3 since W shape is (N, K_packed) but we multiply by (K_packed, N)
+        acc += tl.dot(x0_q, tl.trans(w0))
+        acc += tl.dot(x1_q, tl.trans(w1))
+        acc += tl.dot(x2_q, tl.trans(w2))
+        acc += tl.dot(x3_q, tl.trans(w3))
         
     # -------------------------------------------------------------
     # 4. Epilogue: Scale GEMM accumulator back to float and write
@@ -186,6 +236,7 @@ def bitnet_fused_gemm(X: torch.Tensor, packed_W: torch.Tensor, eps: float = 1e-5
         BLOCK_M=BLOCK_M,
         BLOCK_N=BLOCK_N,
         BLOCK_K=BLOCK_K,
+        BLOCK_K_PACKED=BLOCK_K // 4,
     )
     
     return Y

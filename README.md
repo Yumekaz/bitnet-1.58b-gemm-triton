@@ -95,7 +95,7 @@ The script runs:
 3. Latency benchmarks across sequence lengths.
 4. A chart saved as `benchmark_results.png`.
 
-## Last Captured Benchmark Status
+## Current Benchmark Status
 
 Google Colab Tesla T4 validation passes for both the main benchmark shape and a
 non-multiple-of-4 hidden dimension:
@@ -105,9 +105,9 @@ M=128, N=1024, K=2048: max diff 8.6578e-02, rtol=1e-2, atol=1e-1
 M=17,  N=129,  K=513:  max diff 2.4048e-02, rtol=1e-2, atol=1e-1
 ```
 
-The captured baseline below was produced by the earlier four-dot unpack layout.
-That kernel was correctness-valid, but not performance-competitive. On a Tesla
-T4 with `N=4096, K=4096`, it was slower than the PyTorch quantized reference:
+The current kernel is correctness-valid, but not yet performance-competitive.
+On a Tesla T4 with `N=4096, K=4096`, it is slower than the PyTorch quantized
+reference:
 
 | M | Dense FP16 (ms) | Quant Ref (ms) | Fused Triton (ms) | Speedup vs Quant Ref |
 |---:|---:|---:|---:|---:|
@@ -124,9 +124,8 @@ T4 with `N=4096, K=4096`, it was slower than the PyTorch quantized reference:
 
 ## Next Engineering Targets
 
-- Benchmark the current single-dot unpack layout against the captured four-dot
-  baseline and keep whichever layout is faster after correctness validation.
-- Reduce redundant packed-weight reloads in the single-dot layout.
+- Reduce kernel overhead by replacing the four independent `tl.dot` calls per
+  packed block with a more efficient layout or accumulation strategy.
 - Reduce activation bandwidth by avoiding the current two-pass activation read
   for RMS/max statistics and GEMM input loading.
 - Replace the current `float16` `tl.dot` path with a true integer or ternary
