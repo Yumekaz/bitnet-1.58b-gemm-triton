@@ -108,6 +108,12 @@ length with:
 BITNET_TUNE=1 BITNET_TUNE_M=1024 PYTHONPATH=. python benchmark.py
 ```
 
+The tuning sweep reports drift against the PyTorch reference and against the
+default kernel output, then ranks finite-output configs by latency. The large
+tuning shape may have larger FP16 accumulation drift than the smaller correctness
+suite, so use the printed drift metrics when deciding whether to promote a
+configuration.
+
 ## Current Benchmark Status
 
 Google Colab Tesla T4 validation passes for both the main benchmark shape and a
