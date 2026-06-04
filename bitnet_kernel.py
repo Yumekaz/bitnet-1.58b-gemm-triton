@@ -18,6 +18,7 @@ def _bitnet_fused_gemm_kernel(
     BLOCK_M: tl.constexpr,
     BLOCK_N: tl.constexpr,
     BLOCK_K: tl.constexpr,
+    BLOCK_K_PACKED: tl.constexpr,
 ):
     """
     Fused Triton Kernel for BitNet 1.58b:
@@ -82,7 +83,6 @@ def _bitnet_fused_gemm_kernel(
     acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
     
     # Weight K dimension is packed by 4
-    BLOCK_K_PACKED = BLOCK_K // 4
     K_PACKED = tl.cdiv(K, 4)
     
     for k_idx in range(0, tl.cdiv(K_PACKED, BLOCK_K_PACKED)):
@@ -115,10 +115,31 @@ def _bitnet_fused_gemm_kernel(
         # Apply RMSNorm and quantize into integer-valued fp16 tiles:
         # x_quant = round( (x / rms) * quant_scale )
         # Divide by rms and multiply by scale using row broadcasting
-        x0_q = tl.math.round((x0 / rms[:, None]) * quant_scale[:, None]).to(tl.float16)
-        x1_q = tl.math.round((x1 / rms[:, None]) * quant_scale[:, None]).to(tl.float16)
-        x2_q = tl.math.round((x2 / rms[:, None]) * quant_scale[:, None]).to(tl.float16)
-        x3_q = tl.math.round((x3 / rms[:, None]) * quant_scale[:, None]).to(tl.float16)
+        x0_scaled = (x0 / rms[:, None]) * quant_scale[:, None]
+        x1_scaled = (x1 / rms[:, None]) * quant_scale[:, None]
+        x2_scaled = (x2 / rms[:, None]) * quant_scale[:, None]
+        x3_scaled = (x3 / rms[:, None]) * quant_scale[:, None]
+
+        x0_q = tl.where(
+            x0_scaled >= 0.0,
+            tl.floor(x0_scaled + 0.5),
+            tl.ceil(x0_scaled - 0.5),
+        ).to(tl.float16)
+        x1_q = tl.where(
+            x1_scaled >= 0.0,
+            tl.floor(x1_scaled + 0.5),
+            tl.ceil(x1_scaled - 0.5),
+        ).to(tl.float16)
+        x2_q = tl.where(
+            x2_scaled >= 0.0,
+            tl.floor(x2_scaled + 0.5),
+            tl.ceil(x2_scaled - 0.5),
+        ).to(tl.float16)
+        x3_q = tl.where(
+            x3_scaled >= 0.0,
+            tl.floor(x3_scaled + 0.5),
+            tl.ceil(x3_scaled - 0.5),
+        ).to(tl.float16)
         
         # ---------------------------------------------------------
         # B. Load Packed Weights & Unpack in SRAM
@@ -215,6 +236,7 @@ def bitnet_fused_gemm(X: torch.Tensor, packed_W: torch.Tensor, eps: float = 1e-5
         BLOCK_M=BLOCK_M,
         BLOCK_N=BLOCK_N,
         BLOCK_K=BLOCK_K,
+        BLOCK_K_PACKED=BLOCK_K // 4,
     )
     
     return Y

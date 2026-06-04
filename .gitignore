@@ -19,5 +19,7 @@ build/
 dist/
 *.egg-info/
 *.png
+!assets/
+!assets/*.png
 *.csv
 *.log

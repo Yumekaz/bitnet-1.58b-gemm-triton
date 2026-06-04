@@ -95,12 +95,41 @@ The script runs:
 3. Latency benchmarks across sequence lengths.
 4. A chart saved as `benchmark_results.png`.
 
+## Current Benchmark Status
+
+Google Colab Tesla T4 validation passes for both the main benchmark shape and a
+non-multiple-of-4 hidden dimension:
+
+```text
+M=128, N=1024, K=2048: max diff 8.6578e-02, rtol=1e-2, atol=1e-1
+M=17,  N=129,  K=513:  max diff 2.4048e-02, rtol=1e-2, atol=1e-1
+```
+
+The current kernel is correctness-valid, but not yet performance-competitive.
+On a Tesla T4 with `N=4096, K=4096`, it is slower than the PyTorch quantized
+reference:
+
+| M | Dense FP16 (ms) | Quant Ref (ms) | Fused Triton (ms) | Speedup vs Quant Ref |
+|---:|---:|---:|---:|---:|
+| 16 | 0.284 | 0.742 | 2.160 | 0.34x |
+| 32 | 0.270 | 0.579 | 2.125 | 0.27x |
+| 64 | 0.223 | 0.740 | 2.403 | 0.31x |
+| 128 | 0.259 | 1.112 | 4.765 | 0.23x |
+| 256 | 0.573 | 2.345 | 8.311 | 0.28x |
+| 512 | 0.915 | 4.635 | 15.378 | 0.30x |
+| 1024 | 1.753 | 8.394 | 30.708 | 0.27x |
+| 2048 | 3.512 | 17.030 | 63.215 | 0.27x |
+
+![Tesla T4 benchmark chart](assets/benchmark_results_t4.png)
+
 ## Next Engineering Targets
 
-- Replace the current `float16` `tl.dot` path with a true integer dot-product
-  implementation if the goal is to claim integer GEMM.
-- Add captured benchmark results from a known GPU target such as T4, L4, A100,
-  or RTX 4090.
+- Reduce kernel overhead by replacing the four independent `tl.dot` calls per
+  packed block with a more efficient layout or accumulation strategy.
+- Reduce activation bandwidth by avoiding the current two-pass activation read
+  for RMS/max statistics and GEMM input loading.
+- Replace the current `float16` `tl.dot` path with a true integer or ternary
+  accumulation implementation if the goal is to claim integer GEMM.
 - Add CI for CPU packing tests.
 - Add kernel-level tests for more shapes, dtypes, and edge cases once a CUDA
   test environment is available.

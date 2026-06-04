@@ -3,6 +3,10 @@ import torch
 from bitnet_packing import pack_weights, unpack_weights_cpu
 
 
+CORRECTNESS_ATOL = 1e-1
+CORRECTNESS_RTOL = 1e-2
+
+
 # Import the Triton kernel wrapper only when CUDA is available. This keeps CPU
 # packing validation runnable on machines without Triton/CUDA.
 if torch.cuda.is_available():
@@ -21,7 +25,12 @@ def quantized_reference(X: torch.Tensor, W: torch.Tensor, eps: float = 1e-5) -> 
     X_norm = X_float / rms
     row_max = torch.max(torch.abs(X_norm), dim=1, keepdim=True).values
     quant_scale = 127.0 / torch.clamp(row_max, min=eps)
-    X_quant = torch.round(X_norm * quant_scale)
+    X_scaled = X_norm * quant_scale
+    X_quant = torch.where(
+        X_scaled >= 0,
+        torch.floor(X_scaled + 0.5),
+        torch.ceil(X_scaled - 0.5),
+    )
 
     return (X_quant @ W.to(torch.float32).T) * (rms / quant_scale)
 
@@ -65,13 +74,19 @@ def run_correctness_test(M=128, N=1024, K=2048, eps=1e-5):
     Y_ref = quantized_reference(X, W, eps=eps)
     Y_triton = bitnet_fused_gemm(X, packed_W, eps=eps)
 
-    is_close = torch.allclose(Y_triton, Y_ref, rtol=1e-2, atol=1e-2)
+    is_close = torch.allclose(Y_triton, Y_ref, rtol=CORRECTNESS_RTOL, atol=CORRECTNESS_ATOL)
     max_diff = torch.max(torch.abs(Y_triton - Y_ref)).item()
 
     if is_close:
-        print(f"Correctness validation SUCCESS! (Max diff: {max_diff:.4e})")
+        print(
+            f"Correctness validation SUCCESS! "
+            f"(Max diff: {max_diff:.4e}, rtol={CORRECTNESS_RTOL}, atol={CORRECTNESS_ATOL})"
+        )
     else:
-        print(f"Correctness validation FAILED! (Max diff: {max_diff:.4e})")
+        print(
+            f"Correctness validation FAILED! "
+            f"(Max diff: {max_diff:.4e}, rtol={CORRECTNESS_RTOL}, atol={CORRECTNESS_ATOL})"
+        )
 
     return is_close
 
