@@ -125,8 +125,15 @@ M=17,  N=129,  K=513:  max diff 2.4048e-02, rtol=1e-2, atol=1e-1
 ```
 
 The current kernel is correctness-valid, but not yet performance-competitive.
-On a Tesla T4 with `N=4096, K=4096`, it is slower than the PyTorch quantized
-reference:
+The full benchmark table below was captured on Tesla T4 with the original
+`BLOCK_M=64, BLOCK_N=64, BLOCK_K=64` default. A later tuning sweep promoted
+`BLOCK_M=32, BLOCK_N=128, BLOCK_K=64, num_warps=4, num_stages=3` as the current
+default after improving the `M=512, N=4096, K=4096` kernel latency from
+`16.514 ms` to `9.155 ms` with identical output to the old default. The full
+chart should be regenerated for the promoted default.
+
+On a Tesla T4 with `N=4096, K=4096`, the original default was slower than the
+PyTorch quantized reference:
 
 | M | Dense FP16 (ms) | Quant Ref (ms) | Fused Triton (ms) | Speedup vs Quant Ref |
 |---:|---:|---:|---:|---:|
