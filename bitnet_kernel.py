@@ -22,14 +22,14 @@ def _bitnet_fused_gemm_kernel(
     """
     Fused Triton Kernel for BitNet 1.58b:
     1. Computes RMSNorm for each row block of X on the fly.
-    2. Quantizes normalized activations to int8.
+    2. Quantizes normalized activations into the int8 value range.
     3. Loads 2-bit packed weights from HBM to SRAM.
     4. Unpacks weights on the fly using bit shifts.
     5. Computes high-performance GEMM and writes results to Y.
     
     Weight Packing Details:
-      W contains values packed as 2-bit weights in int8. 
-      Inner dimension K is packed by a factor of 4.
+      W contains values packed as 2-bit weights in int8.
+      Inner dimension K is packed by a factor of 4, rounded up.
       Stride of packed K dimension is stride_wk.
     """
     # Identify the row and column of the output tile this program block computes
@@ -49,7 +49,7 @@ def _bitnet_fused_gemm_kernel(
     # -------------------------------------------------------------
     # 2. First Pass: Compute RMS and max absolute value per row of X
     # -------------------------------------------------------------
-    # We need RMS to normalize X, and max absolute value to scale/quantize to int8.
+    # We need RMS to normalize X, and max absolute value to scale/quantize into int8 range.
     # Accumulate sum of squares and max values across the K dimension.
     row_sum_sq = tl.zeros((BLOCK_M,), dtype=tl.float32)
     row_max_val = tl.zeros((BLOCK_M,), dtype=tl.float32)
@@ -83,7 +83,7 @@ def _bitnet_fused_gemm_kernel(
     
     # Weight K dimension is packed by 4
     BLOCK_K_PACKED = BLOCK_K // 4
-    K_PACKED = K // 4
+    K_PACKED = tl.cdiv(K, 4)
     
     for k_idx in range(0, tl.cdiv(K_PACKED, BLOCK_K_PACKED)):
         # Compute packed K offsets
@@ -112,7 +112,7 @@ def _bitnet_fused_gemm_kernel(
         x2 = tl.load(x_ptr + x2_offs, mask=mask_x2, other=0.0).to(tl.float32)
         x3 = tl.load(x_ptr + x3_offs, mask=mask_x3, other=0.0).to(tl.float32)
         
-        # Apply RMSNorm and Quantize on-the-fly to int8:
+        # Apply RMSNorm and quantize into integer-valued fp16 tiles:
         # x_quant = round( (x / rms) * quant_scale )
         # Divide by rms and multiply by scale using row broadcasting
         x0_q = tl.math.round((x0 / rms[:, None]) * quant_scale[:, None]).to(tl.float16)
@@ -170,7 +170,7 @@ def bitnet_fused_gemm(X: torch.Tensor, packed_W: torch.Tensor, eps: float = 1e-5
     
     Arguments:
       X: Input activation tensor of shape (M, K), dtype float16 or float32.
-      packed_W: Packed 2-bit weight tensor of shape (N, K // 4), dtype int8.
+      packed_W: Packed 2-bit weight tensor of shape (N, ceil(K / 4)), dtype int8.
       eps: Epsilon for numerical stability in RMSNorm.
       
     Returns:
@@ -183,7 +183,11 @@ def bitnet_fused_gemm(X: torch.Tensor, packed_W: torch.Tensor, eps: float = 1e-5
     
     M, K = X.shape
     N, K_packed = packed_W.shape
-    assert K // 4 == K_packed, f"Weight K packing mismatch: X K={K}, packed_W K_packed={K_packed}"
+    expected_k_packed = (K + 3) // 4
+    assert expected_k_packed == K_packed, (
+        f"Weight K packing mismatch: X K={K}, expected packed K={expected_k_packed}, "
+        f"packed_W K_packed={K_packed}"
+    )
     
     # Output tensor allocation
     Y = torch.empty((M, N), device=X.device, dtype=torch.float32)

@@ -1,10 +1,11 @@
 import torch
 
+
 def pack_weights(W: torch.Tensor) -> torch.Tensor:
     """
     Packs a 2D ternary weight matrix W of shape (N, K) containing values in {-1, 0, 1}
-    into a packed int8 tensor of shape (N, K // 4) along the K dimension.
-    If K is not a multiple of 4, it pads K with 0s (which map to '0' weight).
+    into a packed int8 tensor of shape (N, ceil(K / 4)) along the K dimension.
+    If K is not a multiple of 4, it pads K with zero weights.
     
     Mapping rule:
       -1 -> 0 (binary 00)
@@ -27,8 +28,9 @@ def pack_weights(W: torch.Tensor) -> torch.Tensor:
     if not torch.all((W_clamped == -1) | (W_clamped == 0) | (W_clamped == 1)):
         raise ValueError("Weights must only contain -1, 0, or 1.")
         
-    # Map {-1, 0, 1} to {0, 1, 2}
-    W_mapped = W_clamped + 1
+    # Map {-1, 0, 1} to {0, 1, 2}. Use int16 while shifting so values whose
+    # high bit is set are only converted to signed int8 after packing.
+    W_mapped = (W_clamped + 1).to(torch.int16)
     
     # Vectorized bit-packing: pack 4 values into a single int8 byte
     # We slice W_mapped along the K dimension with stride 4
@@ -52,14 +54,27 @@ def unpack_weights_cpu(packed_W: torch.Tensor, original_shape=None) -> torch.Ten
     removing any padding.
     """
     assert packed_W.dim() == 2, "Packed weight matrix must be 2D"
+    if packed_W.dtype != torch.int8:
+        raise TypeError("Packed weights must use torch.int8 dtype.")
+
     N, K_packed = packed_W.shape
+    if original_shape is not None:
+        if len(original_shape) != 2:
+            raise ValueError("original_shape must be a 2D shape tuple.")
+        if original_shape[0] != N:
+            raise ValueError("original_shape row count must match packed weights.")
+        if original_shape[1] > K_packed * 4:
+            raise ValueError("original_shape K is larger than the packed capacity.")
+
+    # Interpret bytes as unsigned before shifting. packed_W is stored as int8, so
+    # bytes with the high bit set are negative when viewed as signed integers.
+    packed_unsigned = packed_W.to(torch.int16) & 0xFF
     
     # Extract the 2-bit values
-    # Use bitwise shifts and mask with 0b11 (3) to prevent sign extension issues
-    w0 = (packed_W >> 0) & 3
-    w1 = (packed_W >> 2) & 3
-    w2 = (packed_W >> 4) & 3
-    w3 = (packed_W >> 6) & 3
+    w0 = (packed_unsigned >> 0) & 3
+    w1 = (packed_unsigned >> 2) & 3
+    w2 = (packed_unsigned >> 4) & 3
+    w3 = (packed_unsigned >> 6) & 3
     
     # Interleave the extracted channels back into the sequence
     # Shape: (N, K_packed, 4)
