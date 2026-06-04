@@ -125,26 +125,23 @@ M=17,  N=129,  K=513:  max diff 2.4048e-02, rtol=1e-2, atol=1e-1
 ```
 
 The current kernel is correctness-valid, but not yet performance-competitive.
-The full benchmark table below was captured on Tesla T4 with the original
-`BLOCK_M=64, BLOCK_N=64, BLOCK_K=64` default. A later tuning sweep promoted
-`BLOCK_M=32, BLOCK_N=128, BLOCK_K=64, num_warps=4, num_stages=3` as the current
-default after improving the `M=512, N=4096, K=4096` kernel latency from
-`16.514 ms` to `9.155 ms` with identical output to the old default. The full
-chart should be regenerated for the promoted default.
+After a tuning sweep, the default Triton launch config is
+`BLOCK_M=32, BLOCK_N=128, BLOCK_K=64, num_warps=4, num_stages=3`. This improves
+the full benchmark substantially over the original `64x64x64` default, but it
+is still slower than the PyTorch quantized reference for most sequence lengths.
 
-On a Tesla T4 with `N=4096, K=4096`, the original default was slower than the
-PyTorch quantized reference:
+Tesla T4 results with `N=4096, K=4096`:
 
 | M | Dense FP16 (ms) | Quant Ref (ms) | Fused Triton (ms) | Speedup vs Quant Ref |
 |---:|---:|---:|---:|---:|
-| 16 | 0.284 | 0.742 | 2.160 | 0.34x |
-| 32 | 0.270 | 0.579 | 2.125 | 0.27x |
-| 64 | 0.223 | 0.740 | 2.403 | 0.31x |
-| 128 | 0.259 | 1.112 | 4.765 | 0.23x |
-| 256 | 0.573 | 2.345 | 8.311 | 0.28x |
-| 512 | 0.915 | 4.635 | 15.378 | 0.30x |
-| 1024 | 1.753 | 8.394 | 30.708 | 0.27x |
-| 2048 | 3.512 | 17.030 | 63.215 | 0.27x |
+| 16 | 0.284 | 0.741 | 0.746 | 0.99x |
+| 32 | 0.217 | 0.450 | 0.782 | 0.58x |
+| 64 | 0.229 | 0.761 | 1.391 | 0.55x |
+| 128 | 0.265 | 1.296 | 2.709 | 0.48x |
+| 256 | 0.606 | 2.775 | 4.752 | 0.58x |
+| 512 | 1.009 | 5.447 | 8.927 | 0.61x |
+| 1024 | 2.071 | 9.626 | 18.754 | 0.51x |
+| 2048 | 4.531 | 19.466 | 38.639 | 0.50x |
 
 ![Tesla T4 benchmark chart](assets/benchmark_results_t4.png)
 
