@@ -1,3 +1,5 @@
+import os
+
 import torch
 
 from bitnet_packing import pack_weights, unpack_weights_cpu
@@ -7,12 +9,42 @@ CORRECTNESS_ATOL = 1e-1
 CORRECTNESS_RTOL = 1e-2
 
 
+def kernel_config(block_m, block_n, block_k, num_warps=4, num_stages=3):
+    name = f"m{block_m}_n{block_n}_k{block_k}_w{num_warps}_s{num_stages}"
+    return {
+        "name": name,
+        "block_m": block_m,
+        "block_n": block_n,
+        "block_k": block_k,
+        "num_warps": num_warps,
+        "num_stages": num_stages,
+    }
+
+
+KERNEL_CONFIGS = [
+    kernel_config(32, 32, 64),
+    kernel_config(32, 64, 64),
+    kernel_config(64, 32, 64),
+    kernel_config(64, 64, 64),
+    kernel_config(32, 128, 64),
+    kernel_config(64, 128, 64),
+    kernel_config(128, 64, 64),
+    kernel_config(32, 64, 128),
+    kernel_config(64, 64, 128),
+    kernel_config(64, 64, 64, num_warps=8),
+]
+
+
 # Import the Triton kernel wrapper only when CUDA is available. This keeps CPU
 # packing validation runnable on machines without Triton/CUDA.
 if torch.cuda.is_available():
     from bitnet_kernel import bitnet_fused_gemm
 else:
     bitnet_fused_gemm = None
+
+
+def kernel_kwargs(config):
+    return {key: value for key, value in config.items() if key != "name"}
 
 
 def quantized_reference(X: torch.Tensor, W: torch.Tensor, eps: float = 1e-5) -> torch.Tensor:
@@ -206,11 +238,73 @@ def run_benchmark(N=4096, K=4096):
     print("\nBenchmark chart saved as 'benchmark_results.png'")
 
 
+def run_tuning_sweep(M=512, N=4096, K=4096):
+    """
+    Sweeps a small set of kernel tile/launch configs on one representative shape.
+    Use this on a GPU machine with: BITNET_TUNE=1 PYTHONPATH=. python benchmark.py
+    """
+    if not torch.cuda.is_available():
+        print("CUDA is not available on this system. Skipping kernel tuning sweep.")
+        return None
+
+    import triton
+
+    print(f"\nStarting kernel config sweep for M={M}, N={N}, K={K}...")
+    torch.manual_seed(0)
+    device = torch.device("cuda")
+
+    X = torch.randn((M, K), device=device, dtype=torch.float16)
+    W_cpu = torch.randint(-1, 2, (N, K), dtype=torch.float32)
+    W = W_cpu.to(device)
+    packed_W = pack_weights(W_cpu).to(device)
+    Y_ref = quantized_reference(X, W)
+
+    results = []
+    for config in KERNEL_CONFIGS:
+        kwargs = kernel_kwargs(config)
+        name = config["name"]
+        try:
+            Y_triton = bitnet_fused_gemm(X, packed_W, **kwargs)
+            torch.cuda.synchronize()
+
+            max_diff = torch.max(torch.abs(Y_triton - Y_ref)).item()
+            is_close = torch.allclose(
+                Y_triton,
+                Y_ref,
+                rtol=CORRECTNESS_RTOL,
+                atol=CORRECTNESS_ATOL,
+            )
+            if not is_close:
+                print(f"{name:20s} | FAILED correctness | max diff {max_diff:.4e}")
+                continue
+
+            ms = triton.testing.do_bench(lambda: bitnet_fused_gemm(X, packed_W, **kwargs))
+            results.append((ms, name, max_diff, kwargs))
+            print(f"{name:20s} | {ms:8.3f} ms | max diff {max_diff:.4e}")
+        except Exception as exc:
+            print(f"{name:20s} | ERROR | {type(exc).__name__}: {exc}")
+
+    if not results:
+        print("No valid kernel configs completed.")
+        return None
+
+    results.sort(key=lambda row: row[0])
+    best_ms, best_name, best_diff, best_kwargs = results[0]
+    print("\nBest kernel config:")
+    print(f"  {best_name}: {best_ms:.3f} ms, max diff {best_diff:.4e}")
+    print(f"  kwargs={best_kwargs}")
+    return best_kwargs
+
+
 if __name__ == "__main__":
     run_cpu_packing_validation()
 
     if torch.cuda.is_available():
         if run_correctness_suite():
-            run_benchmark()
+            if os.environ.get("BITNET_TUNE") == "1":
+                tune_m = int(os.environ.get("BITNET_TUNE_M", "512"))
+                run_tuning_sweep(M=tune_m)
+            else:
+                run_benchmark()
     else:
         run_benchmark()

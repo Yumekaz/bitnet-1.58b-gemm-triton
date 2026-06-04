@@ -95,6 +95,19 @@ The script runs:
 3. Latency benchmarks across sequence lengths.
 4. A chart saved as `benchmark_results.png`.
 
+To sweep Triton tile and launch parameters on one representative shape:
+
+```bash
+BITNET_TUNE=1 PYTHONPATH=. python benchmark.py
+```
+
+By default, this tunes at `M=512, N=4096, K=4096`. You can change the sequence
+length with:
+
+```bash
+BITNET_TUNE=1 BITNET_TUNE_M=1024 PYTHONPATH=. python benchmark.py
+```
+
 ## Current Benchmark Status
 
 Google Colab Tesla T4 validation passes for both the main benchmark shape and a
@@ -124,8 +137,10 @@ reference:
 
 ## Next Engineering Targets
 
-- Reduce kernel overhead by replacing the four independent `tl.dot` calls per
-  packed block with a more efficient layout or accumulation strategy.
+- Run the kernel config sweep on Tesla T4 and promote the fastest correct
+  `BLOCK_M/BLOCK_N/BLOCK_K/num_warps/num_stages` configuration.
+- Optimize the packed-weight unpack layout without redundantly reloading packed
+  bytes across logical weight lanes.
 - Reduce activation bandwidth by avoiding the current two-pass activation read
   for RMS/max statistics and GEMM input loading.
 - Replace the current `float16` `tl.dot` path with a true integer or ternary

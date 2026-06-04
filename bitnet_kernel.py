@@ -2,6 +2,14 @@ import torch
 import triton
 import triton.language as tl
 
+
+DEFAULT_BLOCK_M = 64
+DEFAULT_BLOCK_N = 64
+DEFAULT_BLOCK_K = 64
+DEFAULT_NUM_WARPS = 4
+DEFAULT_NUM_STAGES = 3
+
+
 @triton.jit
 def _bitnet_fused_gemm_kernel(
     # Pointers to matrices
@@ -185,7 +193,17 @@ def _bitnet_fused_gemm_kernel(
     tl.store(y_ptr + y_offsets, y_val, mask=mask_y)
 
 
-def bitnet_fused_gemm(X: torch.Tensor, packed_W: torch.Tensor, eps: float = 1e-5) -> torch.Tensor:
+def bitnet_fused_gemm(
+    X: torch.Tensor,
+    packed_W: torch.Tensor,
+    eps: float = 1e-5,
+    *,
+    block_m: int = DEFAULT_BLOCK_M,
+    block_n: int = DEFAULT_BLOCK_N,
+    block_k: int = DEFAULT_BLOCK_K,
+    num_warps: int = DEFAULT_NUM_WARPS,
+    num_stages: int = DEFAULT_NUM_STAGES,
+) -> torch.Tensor:
     """
     Python wrapper for the fused BitNet GEMM Triton kernel.
     
@@ -193,6 +211,8 @@ def bitnet_fused_gemm(X: torch.Tensor, packed_W: torch.Tensor, eps: float = 1e-5
       X: Input activation tensor of shape (M, K), dtype float16 or float32.
       packed_W: Packed 2-bit weight tensor of shape (N, ceil(K / 4)), dtype int8.
       eps: Epsilon for numerical stability in RMSNorm.
+      block_m/block_n/block_k: Triton tile sizes.
+      num_warps/num_stages: Triton launch tuning parameters.
       
     Returns:
       Y: Output tensor of shape (M, N), dtype float32.
@@ -201,6 +221,8 @@ def bitnet_fused_gemm(X: torch.Tensor, packed_W: torch.Tensor, eps: float = 1e-5
     assert packed_W.is_cuda, "Weights must be on CUDA"
     assert X.dim() == 2, "X must be 2D"
     assert packed_W.dim() == 2, "W must be 2D"
+    assert block_m > 0 and block_n > 0 and block_k > 0, "Block sizes must be positive"
+    assert block_k % 4 == 0, "block_k must be a multiple of 4 for packed weights"
     
     M, K = X.shape
     N, K_packed = packed_W.shape
@@ -212,12 +234,6 @@ def bitnet_fused_gemm(X: torch.Tensor, packed_W: torch.Tensor, eps: float = 1e-5
     
     # Output tensor allocation
     Y = torch.empty((M, N), device=X.device, dtype=torch.float32)
-    
-    # Block size configuration
-    # These sizes are optimized to fit GPU shared memory limit (SRAM limits)
-    BLOCK_M = 64
-    BLOCK_N = 64
-    BLOCK_K = 64  # Must be a multiple of 4 since we pack 4 elements per byte
     
     # Grid size definition (2D Grid over M and N dimensions)
     grid = lambda meta: (
@@ -233,10 +249,12 @@ def bitnet_fused_gemm(X: torch.Tensor, packed_W: torch.Tensor, eps: float = 1e-5
         packed_W.stride(0), packed_W.stride(1),
         Y.stride(0), Y.stride(1),
         eps,
-        BLOCK_M=BLOCK_M,
-        BLOCK_N=BLOCK_N,
-        BLOCK_K=BLOCK_K,
-        BLOCK_K_PACKED=BLOCK_K // 4,
+        BLOCK_M=block_m,
+        BLOCK_N=block_n,
+        BLOCK_K=block_k,
+        BLOCK_K_PACKED=block_k // 4,
+        num_warps=num_warps,
+        num_stages=num_stages,
     )
     
     return Y
