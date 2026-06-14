@@ -141,46 +141,61 @@ the packed ternary GEMM path itself, especially unpacking plus the four fp16
 
 The pre-unpacked-weight control is a deliberately simple Triton kernel using one
 fp16 `tl.dot`. Weight conversion happens once before timing. The packed path is
-6.4x-13.3x faster than this control on T4:
+8.5x-14.6x faster than this control on T4:
 
 | M | Packed GEMM (ms) | Naive unpacked GEMM (ms) | Packed speedup |
 |---:|---:|---:|---:|
-| 16 | 0.945 | 6.054 | 6.41x |
-| 32 | 0.744 | 6.067 | 8.15x |
-| 64 | 1.361 | 13.682 | 10.05x |
-| 128 | 2.642 | 28.199 | 10.67x |
-| 256 | 4.640 | 58.622 | 12.63x |
-| 512 | 8.719 | 115.896 | 13.29x |
-| 1024 | 17.678 | 232.297 | 13.14x |
-| 2048 | 36.082 | 465.184 | 12.89x |
+| 16 | 0.711 | 6.026 | 8.47x |
+| 32 | 0.673 | 6.027 | 8.95x |
+| 64 | 1.234 | 13.742 | 11.14x |
+| 128 | 2.448 | 28.342 | 11.58x |
+| 256 | 4.263 | 58.753 | 13.78x |
+| 512 | 7.996 | 116.688 | 14.59x |
+| 1024 | 16.254 | 233.878 | 14.39x |
+| 2048 | 32.602 | 468.625 | 14.37x |
 
 This does not isolate bit extraction alone: the unpacked control reads 8x more
 weight data than the 2-bit path and has not been independently tuned. It does
 show that compressed weight traffic can outweigh the runtime unpacking cost in
 this custom-kernel comparison.
 
+The same-input cuBLAS FP16 control is the fair dense baseline for the GEMM
+portion: it receives the same pre-quantized activation matrix and the same
+pre-unpacked FP16 ternary weights as the packed diagnostic path. On T4, the
+packed Triton GEMM is still 3.6x-13.8x slower than this cuBLAS control:
+
+| M | Packed GEMM (ms) | Same-input cuBLAS (ms) | Packed slowdown |
+|---:|---:|---:|---:|
+| 16 | 0.711 | 0.172 | 4.14x |
+| 32 | 0.673 | 0.187 | 3.60x |
+| 64 | 1.234 | 0.190 | 6.50x |
+| 128 | 2.448 | 0.206 | 11.91x |
+| 256 | 4.263 | 0.505 | 8.43x |
+| 512 | 7.996 | 0.703 | 11.37x |
+| 1024 | 16.254 | 1.175 | 13.83x |
+| 2048 | 32.602 | 2.574 | 12.67x |
+
 Tesla T4 results with `N=4096, K=4096`:
 
-| M | Dense FP16 (ms) | Quant Ref (ms) | Packed GEMM (ms) | Fused Triton (ms) | Fused/Packed |
-|---:|---:|---:|---:|---:|---:|
-| 16 | 0.286 | 0.741 | 0.669 | 0.699 | 1.04x |
-| 32 | 0.216 | 0.435 | 0.677 | 0.728 | 1.08x |
-| 64 | 0.225 | 0.733 | 1.295 | 1.298 | 1.00x |
-| 128 | 0.264 | 1.183 | 2.534 | 2.529 | 1.00x |
-| 256 | 0.583 | 2.582 | 4.369 | 4.505 | 1.03x |
-| 512 | 0.978 | 5.010 | 8.398 | 8.582 | 1.02x |
-| 1024 | 1.959 | 9.541 | 17.043 | 18.072 | 1.06x |
-| 2048 | 3.935 | 18.427 | 34.190 | 36.867 | 1.08x |
+| M | Dense FP16 (ms) | Quant Ref (ms) | Same-input cuBLAS (ms) | Packed GEMM (ms) | Fused Triton (ms) | Fused/Packed |
+|---:|---:|---:|---:|---:|---:|---:|
+| 16 | 0.288 | 0.743 | 0.172 | 0.711 | 0.634 | 0.89x |
+| 32 | 0.213 | 0.429 | 0.187 | 0.673 | 0.727 | 1.08x |
+| 64 | 0.224 | 0.684 | 0.190 | 1.234 | 1.265 | 1.03x |
+| 128 | 0.258 | 1.147 | 0.206 | 2.448 | 2.434 | 0.99x |
+| 256 | 0.569 | 2.426 | 0.505 | 4.263 | 4.330 | 1.02x |
+| 512 | 0.924 | 4.673 | 0.703 | 7.996 | 8.238 | 1.03x |
+| 1024 | 1.793 | 8.705 | 1.175 | 16.254 | 17.228 | 1.06x |
+| 2048 | 3.654 | 18.287 | 2.574 | 32.602 | 35.327 | 1.08x |
 
-![Tesla T4 benchmark chart](assets/benchmark_results_t4.png)
+The latest benchmark script also writes `benchmark_results.png`; regenerate the
+chart from a fresh T4 run when publishing updated visuals.
 
 ## Next Engineering Targets
 
-- Run the new same-input cuBLAS FP16 control on T4. It receives the same
-  pre-quantized FP16 activations and row dequantization scale as the packed
-  kernel, and uses FP32 output accumulation when the local PyTorch build
-  exposes `torch.mm(..., out_dtype=torch.float32)`. Activation preprocessing
-  and one-time weight conversion are excluded from both timed paths.
+- Optimize the packed-weight GEMM path against the same-input cuBLAS control.
+  This is now the main performance gap: the custom packed path is still much
+  slower than optimized dense FP16 GEMM despite moving less weight data.
 - Optimize the packed-weight unpack layout without redundantly reloading packed
   bytes across logical weight lanes.
 - Replace the current `float16` `tl.dot` path with a true integer or ternary

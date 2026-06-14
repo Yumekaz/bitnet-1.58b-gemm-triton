@@ -330,7 +330,7 @@ def run_benchmark(N=4096, K=4096):
             f"| Unpacked GEMM: {ms_unpacked:6.3f} ms "
             f"{compiled_msg} | Fused Triton: {ms_triton:6.3f} ms "
             f"| Fused/packed: {ms_triton / ms_packed:.2f}x "
-            f"| Packed/cuBLAS: {ms_packed / ms_cublas:.2f}x "
+            f"| Packed slowdown vs cuBLAS: {ms_packed / ms_cublas:.2f}x "
             f"| Packed speedup vs unpacked: {ms_unpacked / ms_packed:.2f}x "
             f"| Speedup vs Quant Ref: {ms_quantized / ms_triton:.2f}x"
         )
