@@ -133,18 +133,23 @@ After a tuning sweep, the default Triton launch config is
 the full benchmark substantially over the original `64x64x64` default, but it
 is still slower than the PyTorch quantized reference for most sequence lengths.
 
+The packed-GEMM-only diagnostic closely tracks the full fused kernel. That means
+the current bottleneck is not primarily RMSNorm/activation quantization; it is
+the packed ternary GEMM path itself, especially unpacking plus the four fp16
+`tl.dot` accumulations.
+
 Tesla T4 results with `N=4096, K=4096`:
 
-| M | Dense FP16 (ms) | Quant Ref (ms) | Fused Triton (ms) | Speedup vs Quant Ref |
-|---:|---:|---:|---:|---:|
-| 16 | 0.284 | 0.741 | 0.746 | 0.99x |
-| 32 | 0.217 | 0.450 | 0.782 | 0.58x |
-| 64 | 0.229 | 0.761 | 1.391 | 0.55x |
-| 128 | 0.265 | 1.296 | 2.709 | 0.48x |
-| 256 | 0.606 | 2.775 | 4.752 | 0.58x |
-| 512 | 1.009 | 5.447 | 8.927 | 0.61x |
-| 1024 | 2.071 | 9.626 | 18.754 | 0.51x |
-| 2048 | 4.531 | 19.466 | 38.639 | 0.50x |
+| M | Dense FP16 (ms) | Quant Ref (ms) | Packed GEMM (ms) | Fused Triton (ms) | Fused/Packed |
+|---:|---:|---:|---:|---:|---:|
+| 16 | 0.286 | 0.741 | 0.669 | 0.699 | 1.04x |
+| 32 | 0.216 | 0.435 | 0.677 | 0.728 | 1.08x |
+| 64 | 0.225 | 0.733 | 1.295 | 1.298 | 1.00x |
+| 128 | 0.264 | 1.183 | 2.534 | 2.529 | 1.00x |
+| 256 | 0.583 | 2.582 | 4.369 | 4.505 | 1.03x |
+| 512 | 0.978 | 5.010 | 8.398 | 8.582 | 1.02x |
+| 1024 | 1.959 | 9.541 | 17.043 | 18.072 | 1.06x |
+| 2048 | 3.935 | 18.427 | 34.190 | 36.867 | 1.08x |
 
 ![Tesla T4 benchmark chart](assets/benchmark_results_t4.png)
 
@@ -152,14 +157,12 @@ Tesla T4 results with `N=4096, K=4096`:
 
 - Use the packed-GEMM-only diagnostic results to determine whether the main
   bottleneck is activation RMSNorm/quantization or packed-weight GEMM/unpacking.
-- Re-run the Tesla T4 benchmark and refresh the table/chart with the new packed
-  GEMM diagnostic line.
 - Optimize the packed-weight unpack layout without redundantly reloading packed
   bytes across logical weight lanes.
-- Reduce activation bandwidth by avoiding the current two-pass activation read
-  for RMS/max statistics and GEMM input loading.
 - Replace the current `float16` `tl.dot` path with a true integer or ternary
   accumulation implementation if the goal is to claim integer GEMM.
+- Revisit activation bandwidth only after the packed GEMM path improves, since
+  the diagnostic run shows fused overhead is currently small.
 - Add CI for CPU packing tests.
 - Add kernel-level tests for more shapes, dtypes, and edge cases once a CUDA
   test environment is available.
