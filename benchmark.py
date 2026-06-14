@@ -38,10 +38,15 @@ KERNEL_CONFIGS = [
 # Import the Triton kernel wrapper only when CUDA is available. This keeps CPU
 # packing validation runnable on machines without Triton/CUDA.
 if torch.cuda.is_available():
-    from bitnet_kernel import bitnet_fused_gemm, bitnet_packed_gemm
+    from bitnet_kernel import (
+        bitnet_fused_gemm,
+        bitnet_packed_gemm,
+        bitnet_unpacked_gemm,
+    )
 else:
     bitnet_fused_gemm = None
     bitnet_packed_gemm = None
+    bitnet_unpacked_gemm = None
 
 
 def kernel_kwargs(config):
@@ -125,12 +130,16 @@ def run_correctness_test(M=128, N=1024, K=2048, eps=1e-5):
     X_quant, row_scale = precompute_quantized_activations(X, eps=eps)
     Y_ref = (X_quant @ W.to(torch.float32).T) * row_scale[:, None]
     Y_triton = bitnet_fused_gemm(X, packed_W, eps=eps)
-    Y_packed = bitnet_packed_gemm(X_quant.to(torch.float16), packed_W, row_scale)
+    X_quant_half = X_quant.to(torch.float16)
+    Y_packed = bitnet_packed_gemm(X_quant_half, packed_W, row_scale)
+    Y_unpacked = bitnet_unpacked_gemm(X_quant_half, W.to(torch.float16), row_scale)
 
     is_close = torch.allclose(Y_triton, Y_ref, rtol=CORRECTNESS_RTOL, atol=CORRECTNESS_ATOL)
     packed_is_close = torch.allclose(Y_packed, Y_ref, rtol=CORRECTNESS_RTOL, atol=CORRECTNESS_ATOL)
+    unpacked_is_close = torch.allclose(Y_unpacked, Y_ref, rtol=CORRECTNESS_RTOL, atol=CORRECTNESS_ATOL)
     max_diff = torch.max(torch.abs(Y_triton - Y_ref)).item()
     packed_max_diff = torch.max(torch.abs(Y_packed - Y_ref)).item()
+    unpacked_max_diff = torch.max(torch.abs(Y_unpacked - Y_ref)).item()
 
     if is_close:
         print(
@@ -154,7 +163,18 @@ def run_correctness_test(M=128, N=1024, K=2048, eps=1e-5):
             f"(Max diff: {packed_max_diff:.4e}, rtol={CORRECTNESS_RTOL}, atol={CORRECTNESS_ATOL})"
         )
 
-    return is_close and packed_is_close
+    if unpacked_is_close:
+        print(
+            f"Unpacked-GEMM control SUCCESS! "
+            f"(Max diff: {unpacked_max_diff:.4e}, rtol={CORRECTNESS_RTOL}, atol={CORRECTNESS_ATOL})"
+        )
+    else:
+        print(
+            f"Unpacked-GEMM control FAILED! "
+            f"(Max diff: {unpacked_max_diff:.4e}, rtol={CORRECTNESS_RTOL}, atol={CORRECTNESS_ATOL})"
+        )
+
+    return is_close and packed_is_close and unpacked_is_close
 
 
 def run_correctness_suite():
@@ -174,7 +194,9 @@ def run_benchmark(N=4096, K=4096):
       1. Dense FP16 RMSNorm + GEMM as a context baseline.
       2. PyTorch quantized reference for the same math as the Triton kernel.
       3. torch.compile quantized reference when available.
-      4. Custom fused packed Triton kernel.
+      4. Packed Triton GEMM with pre-quantized activations.
+      5. Unpacked-weight Triton GEMM control.
+      6. Custom fused packed Triton kernel.
     """
     if not torch.cuda.is_available():
         print("\n" + "=" * 70)
@@ -198,6 +220,7 @@ def run_benchmark(N=4096, K=4096):
     latencies_quantized_ref = []
     latencies_compiled_quantized = []
     latencies_packed_gemm = []
+    latencies_unpacked_gemm = []
     latencies_triton = []
 
     W_cpu = torch.randint(-1, 2, (N, K), dtype=torch.float32)
@@ -223,7 +246,9 @@ def run_benchmark(N=4096, K=4096):
     if compiled_quantized_reference is not None:
         compiled_quantized_reference(X_warmup)
     Xq_warmup, scale_warmup = precompute_quantized_activations(X_warmup)
-    bitnet_packed_gemm(Xq_warmup.to(torch.float16), packed_W, scale_warmup)
+    Xq_warmup_half = Xq_warmup.to(torch.float16)
+    bitnet_packed_gemm(Xq_warmup_half, packed_W, scale_warmup)
+    bitnet_unpacked_gemm(Xq_warmup_half, W_fp16, scale_warmup)
     bitnet_fused_gemm(X_warmup, packed_W)
     torch.cuda.synchronize()
 
@@ -235,11 +260,15 @@ def run_benchmark(N=4096, K=4096):
         ms_dense = triton.testing.do_bench(lambda: dense_fp16_reference(X))
         ms_quantized = triton.testing.do_bench(lambda: quantized_reference_for_bench(X))
         ms_packed = triton.testing.do_bench(lambda: bitnet_packed_gemm(X_quant_half, packed_W, row_scale))
+        ms_unpacked = triton.testing.do_bench(
+            lambda: bitnet_unpacked_gemm(X_quant_half, W_fp16, row_scale)
+        )
         ms_triton = triton.testing.do_bench(lambda: bitnet_fused_gemm(X, packed_W))
 
         latencies_dense_fp16.append(ms_dense)
         latencies_quantized_ref.append(ms_quantized)
         latencies_packed_gemm.append(ms_packed)
+        latencies_unpacked_gemm.append(ms_unpacked)
         latencies_triton.append(ms_triton)
 
         if compiled_quantized_reference is not None:
@@ -253,8 +282,10 @@ def run_benchmark(N=4096, K=4096):
             f"M={M:4d} | Dense FP16: {ms_dense:6.3f} ms "
             f"| Quant Ref: {ms_quantized:6.3f} ms "
             f"| Packed GEMM: {ms_packed:6.3f} ms "
+            f"| Unpacked GEMM: {ms_unpacked:6.3f} ms "
             f"{compiled_msg} | Fused Triton: {ms_triton:6.3f} ms "
             f"| Fused/packed: {ms_triton / ms_packed:.2f}x "
+            f"| Packed/unpacked: {ms_packed / ms_unpacked:.2f}x "
             f"| Speedup vs Quant Ref: {ms_quantized / ms_triton:.2f}x"
         )
 
@@ -270,6 +301,13 @@ def run_benchmark(N=4096, K=4096):
             linewidth=2,
         )
     plt.plot(M_sizes, latencies_packed_gemm, label="Packed Triton GEMM only", marker="d", linewidth=2)
+    plt.plot(
+        M_sizes,
+        latencies_unpacked_gemm,
+        label="Unpacked-weight Triton control",
+        marker="v",
+        linewidth=2,
+    )
     plt.plot(M_sizes, latencies_triton, label="Custom Fused Packed Triton", marker="x", linewidth=2)
     plt.xscale("log", base=2)
     plt.yscale("log")

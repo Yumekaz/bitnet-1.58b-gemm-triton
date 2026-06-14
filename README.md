@@ -61,11 +61,11 @@ If `K` is not divisible by 4, packing pads the final byte with zero-weight lanes
 
 - `bitnet_packing.py`: CPU/GPU PyTorch utility for packing ternary weights into
   2-bit byte storage and unpacking them for validation.
-- `bitnet_kernel.py`: fused Triton kernel, packed-GEMM diagnostic kernel, and
-  Python wrappers.
+- `bitnet_kernel.py`: fused Triton kernel, packed-GEMM diagnostic kernel,
+  pre-unpacked-weight control kernel, and Python wrappers.
 - `benchmark.py`: CPU packing validation, GPU correctness checks, and benchmark
-  chart generation. It reports both the full fused kernel and a diagnostic
-  packed-GEMM-only path with precomputed activation quantization.
+  chart generation. It reports the full fused kernel, a packed-GEMM-only path,
+  and a pre-unpacked-weight Triton control.
 - `tests/test_packing.py`: fast pytest coverage for packing invariants.
 
 ## Local CPU Validation
@@ -95,7 +95,8 @@ The script runs:
 1. CPU pack/unpack validation.
 2. GPU correctness checks for standard and padded `K` shapes.
 3. Latency benchmarks across sequence lengths for the PyTorch references, the
-   full fused Triton kernel, and the packed-GEMM-only diagnostic path.
+   full fused Triton kernel, the packed-GEMM-only diagnostic path, and the
+   pre-unpacked-weight Triton control.
 4. A chart saved as `benchmark_results.png`.
 
 To sweep Triton tile and launch parameters on one representative shape:
@@ -138,6 +139,11 @@ the current bottleneck is not primarily RMSNorm/activation quantization; it is
 the packed ternary GEMM path itself, especially unpacking plus the four fp16
 `tl.dot` accumulations.
 
+The next benchmark revision adds a pre-unpacked-weight Triton control. Its
+`Packed/unpacked` ratio isolates the combined runtime cost of bit extraction and
+the four-way dot decomposition. Weight conversion to fp16 happens once before
+timing and is intentionally excluded.
+
 Tesla T4 results with `N=4096, K=4096`:
 
 | M | Dense FP16 (ms) | Quant Ref (ms) | Packed GEMM (ms) | Fused Triton (ms) | Fused/Packed |
@@ -155,8 +161,8 @@ Tesla T4 results with `N=4096, K=4096`:
 
 ## Next Engineering Targets
 
-- Use the packed-GEMM-only diagnostic results to determine whether the main
-  bottleneck is activation RMSNorm/quantization or packed-weight GEMM/unpacking.
+- Run the pre-unpacked-weight control and use `Packed/unpacked` to quantify the
+  cost of the packed execution path.
 - Optimize the packed-weight unpack layout without redundantly reloading packed
   bytes across logical weight lanes.
 - Replace the current `float16` `tl.dot` path with a true integer or ternary

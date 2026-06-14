@@ -269,6 +269,57 @@ def _bitnet_packed_gemm_kernel(
     tl.store(y_ptr + y_offsets, y_val, mask=mask_y)
 
 
+@triton.jit
+def _bitnet_unpacked_gemm_kernel(
+    # Pointers to matrices
+    xq_ptr, w_ptr, scale_ptr, y_ptr,
+    # Matrix dimensions
+    M, N, K,
+    # Strides
+    stride_xm, stride_xk,
+    stride_wn, stride_wk,
+    stride_ym, stride_yn,
+    # Block sizes
+    BLOCK_M: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+    BLOCK_K: tl.constexpr,
+):
+    """
+    Control GEMM kernel for pre-unpacked fp16 ternary weights.
+
+    This uses the same pre-quantized activations and row scale as the packed
+    diagnostic, but removes bit extraction and the four-way dot decomposition.
+    """
+    pid_m = tl.program_id(axis=0)
+    pid_n = tl.program_id(axis=1)
+
+    offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
+    offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
+    mask_m = offs_m < M
+
+    acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
+
+    for k_idx in range(0, tl.cdiv(K, BLOCK_K)):
+        offs_k = k_idx * BLOCK_K + tl.arange(0, BLOCK_K)
+
+        x_offsets = offs_m[:, None] * stride_xm + offs_k[None, :] * stride_xk
+        mask_x = (offs_m[:, None] < M) & (offs_k[None, :] < K)
+        x_tile = tl.load(xq_ptr + x_offsets, mask=mask_x, other=0.0).to(tl.float16)
+
+        w_offsets = offs_n[:, None] * stride_wn + offs_k[None, :] * stride_wk
+        mask_w = (offs_n[:, None] < N) & (offs_k[None, :] < K)
+        w_tile = tl.load(w_ptr + w_offsets, mask=mask_w, other=0.0).to(tl.float16)
+
+        acc += tl.dot(x_tile, tl.trans(w_tile))
+
+    row_scale = tl.load(scale_ptr + offs_m, mask=mask_m, other=0.0).to(tl.float32)
+    y_val = acc * row_scale[:, None]
+
+    y_offsets = offs_m[:, None] * stride_ym + offs_n[None, :] * stride_yn
+    mask_y = (offs_m[:, None] < M) & (offs_n[None, :] < N)
+    tl.store(y_ptr + y_offsets, y_val, mask=mask_y)
+
+
 def bitnet_fused_gemm(
     X: torch.Tensor,
     packed_W: torch.Tensor,
@@ -394,6 +445,65 @@ def bitnet_packed_gemm(
         BLOCK_N=block_n,
         BLOCK_K=block_k,
         BLOCK_K_PACKED=block_k // 4,
+        num_warps=num_warps,
+        num_stages=num_stages,
+    )
+
+    return Y
+
+
+def bitnet_unpacked_gemm(
+    X_quant: torch.Tensor,
+    unpacked_W: torch.Tensor,
+    row_scale: torch.Tensor,
+    *,
+    block_m: int = DEFAULT_BLOCK_M,
+    block_n: int = DEFAULT_BLOCK_N,
+    block_k: int = DEFAULT_BLOCK_K,
+    num_warps: int = DEFAULT_NUM_WARPS,
+    num_stages: int = DEFAULT_NUM_STAGES,
+) -> torch.Tensor:
+    """
+    Control wrapper for GEMM with ternary weights pre-unpacked to fp16.
+
+    Weight unpacking/conversion must happen before calling this function and is
+    intentionally excluded from benchmark timing.
+    """
+    assert X_quant.is_cuda, "Quantized activations must be on CUDA"
+    assert unpacked_W.is_cuda, "Unpacked weights must be on CUDA"
+    assert row_scale.is_cuda, "Row scales must be on CUDA"
+    assert X_quant.dim() == 2, "X_quant must be 2D"
+    assert unpacked_W.dim() == 2, "unpacked_W must be 2D"
+    assert X_quant.dtype == torch.float16, "X_quant must use torch.float16"
+    assert unpacked_W.dtype == torch.float16, "unpacked_W must use torch.float16"
+    assert block_m > 0 and block_n > 0 and block_k > 0, "Block sizes must be positive"
+
+    M, K = X_quant.shape
+    N, weight_k = unpacked_W.shape
+    assert K == weight_k, f"Weight K mismatch: X K={K}, unpacked_W K={weight_k}"
+
+    if row_scale.dim() == 2:
+        assert row_scale.shape == (M, 1), "2D row_scale must have shape (M, 1)"
+        row_scale = row_scale.reshape(M)
+    else:
+        assert row_scale.shape == (M,), "row_scale must have shape (M,) or (M, 1)"
+    row_scale = row_scale.contiguous()
+
+    Y = torch.empty((M, N), device=X_quant.device, dtype=torch.float32)
+    grid = lambda meta: (
+        triton.cdiv(M, meta['BLOCK_M']),
+        triton.cdiv(N, meta['BLOCK_N']),
+    )
+
+    _bitnet_unpacked_gemm_kernel[grid](
+        X_quant, unpacked_W, row_scale, Y,
+        M, N, K,
+        X_quant.stride(0), X_quant.stride(1),
+        unpacked_W.stride(0), unpacked_W.stride(1),
+        Y.stride(0), Y.stride(1),
+        BLOCK_M=block_m,
+        BLOCK_N=block_n,
+        BLOCK_K=block_k,
         num_warps=num_warps,
         num_stages=num_stages,
     )
