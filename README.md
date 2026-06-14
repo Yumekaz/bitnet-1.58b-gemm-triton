@@ -139,10 +139,25 @@ the current bottleneck is not primarily RMSNorm/activation quantization; it is
 the packed ternary GEMM path itself, especially unpacking plus the four fp16
 `tl.dot` accumulations.
 
-The next benchmark revision adds a pre-unpacked-weight Triton control. Its
-`Packed/unpacked` ratio isolates the combined runtime cost of bit extraction and
-the four-way dot decomposition. Weight conversion to fp16 happens once before
-timing and is intentionally excluded.
+The pre-unpacked-weight control is a deliberately simple Triton kernel using one
+fp16 `tl.dot`. Weight conversion happens once before timing. The packed path is
+6.4x-13.3x faster than this control on T4:
+
+| M | Packed GEMM (ms) | Naive unpacked GEMM (ms) | Packed speedup |
+|---:|---:|---:|---:|
+| 16 | 0.945 | 6.054 | 6.41x |
+| 32 | 0.744 | 6.067 | 8.15x |
+| 64 | 1.361 | 13.682 | 10.05x |
+| 128 | 2.642 | 28.199 | 10.67x |
+| 256 | 4.640 | 58.622 | 12.63x |
+| 512 | 8.719 | 115.896 | 13.29x |
+| 1024 | 17.678 | 232.297 | 13.14x |
+| 2048 | 36.082 | 465.184 | 12.89x |
+
+This does not isolate bit extraction alone: the unpacked control reads 8x more
+weight data than the 2-bit path and has not been independently tuned. It does
+show that compressed weight traffic can outweigh the runtime unpacking cost in
+this custom-kernel comparison.
 
 Tesla T4 results with `N=4096, K=4096`:
 
@@ -161,8 +176,9 @@ Tesla T4 results with `N=4096, K=4096`:
 
 ## Next Engineering Targets
 
-- Run the pre-unpacked-weight control and use `Packed/unpacked` to quantify the
-  cost of the packed execution path.
+- Add an optimized same-input dense control, such as cuBLAS/PyTorch fp16 GEMM
+  with pre-quantized activations, before attributing the control gap entirely to
+  weight compression.
 - Optimize the packed-weight unpack layout without redundantly reloading packed
   bytes across logical weight lanes.
 - Replace the current `float16` `tl.dot` path with a true integer or ternary

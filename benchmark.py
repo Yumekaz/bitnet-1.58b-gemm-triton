@@ -195,7 +195,7 @@ def run_benchmark(N=4096, K=4096):
       2. PyTorch quantized reference for the same math as the Triton kernel.
       3. torch.compile quantized reference when available.
       4. Packed Triton GEMM with pre-quantized activations.
-      5. Unpacked-weight Triton GEMM control.
+      5. Naive unpacked-weight Triton GEMM control.
       6. Custom fused packed Triton kernel.
     """
     if not torch.cuda.is_available():
@@ -285,7 +285,7 @@ def run_benchmark(N=4096, K=4096):
             f"| Unpacked GEMM: {ms_unpacked:6.3f} ms "
             f"{compiled_msg} | Fused Triton: {ms_triton:6.3f} ms "
             f"| Fused/packed: {ms_triton / ms_packed:.2f}x "
-            f"| Packed/unpacked: {ms_packed / ms_unpacked:.2f}x "
+            f"| Packed speedup vs unpacked: {ms_unpacked / ms_packed:.2f}x "
             f"| Speedup vs Quant Ref: {ms_quantized / ms_triton:.2f}x"
         )
 
@@ -304,7 +304,7 @@ def run_benchmark(N=4096, K=4096):
     plt.plot(
         M_sizes,
         latencies_unpacked_gemm,
-        label="Unpacked-weight Triton control",
+        label="Naive unpacked-weight Triton control",
         marker="v",
         linewidth=2,
     )
