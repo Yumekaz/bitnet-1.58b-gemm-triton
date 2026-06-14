@@ -38,9 +38,10 @@ KERNEL_CONFIGS = [
 # Import the Triton kernel wrapper only when CUDA is available. This keeps CPU
 # packing validation runnable on machines without Triton/CUDA.
 if torch.cuda.is_available():
-    from bitnet_kernel import bitnet_fused_gemm
+    from bitnet_kernel import bitnet_fused_gemm, bitnet_packed_gemm
 else:
     bitnet_fused_gemm = None
+    bitnet_packed_gemm = None
 
 
 def kernel_kwargs(config):
@@ -56,10 +57,10 @@ def diff_stats(actual: torch.Tensor, expected: torch.Tensor):
     }
 
 
-def quantized_reference(X: torch.Tensor, W: torch.Tensor, eps: float = 1e-5) -> torch.Tensor:
+def precompute_quantized_activations(X: torch.Tensor, eps: float = 1e-5):
     """
-    PyTorch reference for the same math as the Triton kernel:
-    RMSNorm -> dynamic int8 activation quantization -> ternary GEMM -> dequant.
+    Precomputes the activation path used by BitNet GEMM:
+    RMSNorm -> dynamic int8-range quantization -> row dequant scale.
     """
     X_float = X.to(torch.float32)
     rms = torch.sqrt(torch.mean(X_float * X_float, dim=1, keepdim=True) + eps)
@@ -72,8 +73,17 @@ def quantized_reference(X: torch.Tensor, W: torch.Tensor, eps: float = 1e-5) -> 
         torch.floor(X_scaled + 0.5),
         torch.ceil(X_scaled - 0.5),
     )
+    row_scale = (rms / quant_scale).reshape(-1)
+    return X_quant, row_scale
 
-    return (X_quant @ W.to(torch.float32).T) * (rms / quant_scale)
+
+def quantized_reference(X: torch.Tensor, W: torch.Tensor, eps: float = 1e-5) -> torch.Tensor:
+    """
+    PyTorch reference for the same math as the Triton kernel:
+    RMSNorm -> dynamic int8 activation quantization -> ternary GEMM -> dequant.
+    """
+    X_quant, row_scale = precompute_quantized_activations(X, eps=eps)
+    return (X_quant @ W.to(torch.float32).T) * row_scale[:, None]
 
 
 def run_cpu_packing_validation():
@@ -112,24 +122,39 @@ def run_correctness_test(M=128, N=1024, K=2048, eps=1e-5):
     W = W_cpu.to(device)
     packed_W = pack_weights(W_cpu).to(device)
 
-    Y_ref = quantized_reference(X, W, eps=eps)
+    X_quant, row_scale = precompute_quantized_activations(X, eps=eps)
+    Y_ref = (X_quant @ W.to(torch.float32).T) * row_scale[:, None]
     Y_triton = bitnet_fused_gemm(X, packed_W, eps=eps)
+    Y_packed = bitnet_packed_gemm(X_quant.to(torch.float16), packed_W, row_scale)
 
     is_close = torch.allclose(Y_triton, Y_ref, rtol=CORRECTNESS_RTOL, atol=CORRECTNESS_ATOL)
+    packed_is_close = torch.allclose(Y_packed, Y_ref, rtol=CORRECTNESS_RTOL, atol=CORRECTNESS_ATOL)
     max_diff = torch.max(torch.abs(Y_triton - Y_ref)).item()
+    packed_max_diff = torch.max(torch.abs(Y_packed - Y_ref)).item()
 
     if is_close:
         print(
-            f"Correctness validation SUCCESS! "
+            f"Fused correctness validation SUCCESS! "
             f"(Max diff: {max_diff:.4e}, rtol={CORRECTNESS_RTOL}, atol={CORRECTNESS_ATOL})"
         )
     else:
         print(
-            f"Correctness validation FAILED! "
+            f"Fused correctness validation FAILED! "
             f"(Max diff: {max_diff:.4e}, rtol={CORRECTNESS_RTOL}, atol={CORRECTNESS_ATOL})"
         )
 
-    return is_close
+    if packed_is_close:
+        print(
+            f"Packed-GEMM diagnostic SUCCESS! "
+            f"(Max diff: {packed_max_diff:.4e}, rtol={CORRECTNESS_RTOL}, atol={CORRECTNESS_ATOL})"
+        )
+    else:
+        print(
+            f"Packed-GEMM diagnostic FAILED! "
+            f"(Max diff: {packed_max_diff:.4e}, rtol={CORRECTNESS_RTOL}, atol={CORRECTNESS_ATOL})"
+        )
+
+    return is_close and packed_is_close
 
 
 def run_correctness_suite():
@@ -172,6 +197,7 @@ def run_benchmark(N=4096, K=4096):
     latencies_dense_fp16 = []
     latencies_quantized_ref = []
     latencies_compiled_quantized = []
+    latencies_packed_gemm = []
     latencies_triton = []
 
     W_cpu = torch.randint(-1, 2, (N, K), dtype=torch.float32)
@@ -196,18 +222,24 @@ def run_benchmark(N=4096, K=4096):
     quantized_reference_for_bench(X_warmup)
     if compiled_quantized_reference is not None:
         compiled_quantized_reference(X_warmup)
+    Xq_warmup, scale_warmup = precompute_quantized_activations(X_warmup)
+    bitnet_packed_gemm(Xq_warmup.to(torch.float16), packed_W, scale_warmup)
     bitnet_fused_gemm(X_warmup, packed_W)
     torch.cuda.synchronize()
 
     for M in M_sizes:
         X = torch.randn((M, K), device=device, dtype=torch.float16)
+        X_quant, row_scale = precompute_quantized_activations(X)
+        X_quant_half = X_quant.to(torch.float16)
 
         ms_dense = triton.testing.do_bench(lambda: dense_fp16_reference(X))
         ms_quantized = triton.testing.do_bench(lambda: quantized_reference_for_bench(X))
+        ms_packed = triton.testing.do_bench(lambda: bitnet_packed_gemm(X_quant_half, packed_W, row_scale))
         ms_triton = triton.testing.do_bench(lambda: bitnet_fused_gemm(X, packed_W))
 
         latencies_dense_fp16.append(ms_dense)
         latencies_quantized_ref.append(ms_quantized)
+        latencies_packed_gemm.append(ms_packed)
         latencies_triton.append(ms_triton)
 
         if compiled_quantized_reference is not None:
@@ -219,8 +251,10 @@ def run_benchmark(N=4096, K=4096):
 
         print(
             f"M={M:4d} | Dense FP16: {ms_dense:6.3f} ms "
-            f"| Quant Ref: {ms_quantized:6.3f} ms"
+            f"| Quant Ref: {ms_quantized:6.3f} ms "
+            f"| Packed GEMM: {ms_packed:6.3f} ms "
             f"{compiled_msg} | Fused Triton: {ms_triton:6.3f} ms "
+            f"| Fused/packed: {ms_triton / ms_packed:.2f}x "
             f"| Speedup vs Quant Ref: {ms_quantized / ms_triton:.2f}x"
         )
 
@@ -235,6 +269,7 @@ def run_benchmark(N=4096, K=4096):
             marker="^",
             linewidth=2,
         )
+    plt.plot(M_sizes, latencies_packed_gemm, label="Packed Triton GEMM only", marker="d", linewidth=2)
     plt.plot(M_sizes, latencies_triton, label="Custom Fused Packed Triton", marker="x", linewidth=2)
     plt.xscale("log", base=2)
     plt.yscale("log")

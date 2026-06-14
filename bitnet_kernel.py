@@ -193,6 +193,82 @@ def _bitnet_fused_gemm_kernel(
     tl.store(y_ptr + y_offsets, y_val, mask=mask_y)
 
 
+@triton.jit
+def _bitnet_packed_gemm_kernel(
+    # Pointers to matrices
+    xq_ptr, w_ptr, scale_ptr, y_ptr,
+    # Matrix dimensions
+    M, N, K,
+    # Strides
+    stride_xm, stride_xk,
+    stride_wn, stride_wk,
+    stride_ym, stride_yn,
+    # Block sizes
+    BLOCK_M: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+    BLOCK_K: tl.constexpr,
+    BLOCK_K_PACKED: tl.constexpr,
+):
+    """
+    Diagnostic packed GEMM kernel:
+    1. Expects activations to already be RMSNormed and quantized.
+    2. Loads packed 2-bit ternary weights and unpacks them on the fly.
+    3. Computes tiled GEMM and applies one row dequantization scale.
+
+    This isolates packed-weight unpacking and GEMM from RMSNorm/quantization.
+    """
+    pid_m = tl.program_id(axis=0)
+    pid_n = tl.program_id(axis=1)
+
+    offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
+    offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
+    mask_m = offs_m < M
+
+    acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
+    K_PACKED = tl.cdiv(K, 4)
+
+    for k_idx in range(0, tl.cdiv(K_PACKED, BLOCK_K_PACKED)):
+        offs_k_packed = k_idx * BLOCK_K_PACKED + tl.arange(0, BLOCK_K_PACKED)
+        k_base = k_idx * BLOCK_K_PACKED * 4
+        cols = tl.arange(0, BLOCK_K_PACKED)
+
+        x0_offs = offs_m[:, None] * stride_xm + (k_base + cols[None, :] * 4 + 0) * stride_xk
+        x1_offs = offs_m[:, None] * stride_xm + (k_base + cols[None, :] * 4 + 1) * stride_xk
+        x2_offs = offs_m[:, None] * stride_xm + (k_base + cols[None, :] * 4 + 2) * stride_xk
+        x3_offs = offs_m[:, None] * stride_xm + (k_base + cols[None, :] * 4 + 3) * stride_xk
+
+        mask_x0 = (offs_m[:, None] < M) & ((k_base + cols[None, :] * 4 + 0) < K)
+        mask_x1 = (offs_m[:, None] < M) & ((k_base + cols[None, :] * 4 + 1) < K)
+        mask_x2 = (offs_m[:, None] < M) & ((k_base + cols[None, :] * 4 + 2) < K)
+        mask_x3 = (offs_m[:, None] < M) & ((k_base + cols[None, :] * 4 + 3) < K)
+
+        x0_q = tl.load(xq_ptr + x0_offs, mask=mask_x0, other=0.0).to(tl.float16)
+        x1_q = tl.load(xq_ptr + x1_offs, mask=mask_x1, other=0.0).to(tl.float16)
+        x2_q = tl.load(xq_ptr + x2_offs, mask=mask_x2, other=0.0).to(tl.float16)
+        x3_q = tl.load(xq_ptr + x3_offs, mask=mask_x3, other=0.0).to(tl.float16)
+
+        w_offs = offs_n[:, None] * stride_wn + offs_k_packed[None, :] * stride_wk
+        mask_w = (offs_n[:, None] < N) & (offs_k_packed[None, :] < K_PACKED)
+        packed_w = tl.load(w_ptr + w_offs, mask=mask_w, other=0)
+
+        w0 = (((packed_w >> 0) & 3) - 1).to(tl.float16)
+        w1 = (((packed_w >> 2) & 3) - 1).to(tl.float16)
+        w2 = (((packed_w >> 4) & 3) - 1).to(tl.float16)
+        w3 = (((packed_w >> 6) & 3) - 1).to(tl.float16)
+
+        acc += tl.dot(x0_q, tl.trans(w0))
+        acc += tl.dot(x1_q, tl.trans(w1))
+        acc += tl.dot(x2_q, tl.trans(w2))
+        acc += tl.dot(x3_q, tl.trans(w3))
+
+    row_scale = tl.load(scale_ptr + offs_m, mask=mask_m, other=0.0).to(tl.float32)
+    y_val = acc * row_scale[:, None]
+
+    y_offsets = offs_m[:, None] * stride_ym + offs_n[None, :] * stride_yn
+    mask_y = (offs_m[:, None] < M) & (offs_n[None, :] < N)
+    tl.store(y_ptr + y_offsets, y_val, mask=mask_y)
+
+
 def bitnet_fused_gemm(
     X: torch.Tensor,
     packed_W: torch.Tensor,
@@ -257,4 +333,69 @@ def bitnet_fused_gemm(
         num_stages=num_stages,
     )
     
+    return Y
+
+
+def bitnet_packed_gemm(
+    X_quant: torch.Tensor,
+    packed_W: torch.Tensor,
+    row_scale: torch.Tensor,
+    *,
+    block_m: int = DEFAULT_BLOCK_M,
+    block_n: int = DEFAULT_BLOCK_N,
+    block_k: int = DEFAULT_BLOCK_K,
+    num_warps: int = DEFAULT_NUM_WARPS,
+    num_stages: int = DEFAULT_NUM_STAGES,
+) -> torch.Tensor:
+    """
+    Diagnostic wrapper for packed-weight GEMM without fused RMSNorm/quantization.
+
+    Arguments:
+      X_quant: Pre-quantized activation tensor of shape (M, K).
+      packed_W: Packed 2-bit weight tensor of shape (N, ceil(K / 4)).
+      row_scale: Per-row dequantization scale, shape (M,) or (M, 1).
+    """
+    assert X_quant.is_cuda, "Quantized activations must be on CUDA"
+    assert packed_W.is_cuda, "Weights must be on CUDA"
+    assert row_scale.is_cuda, "Row scales must be on CUDA"
+    assert X_quant.dim() == 2, "X_quant must be 2D"
+    assert packed_W.dim() == 2, "W must be 2D"
+    assert block_m > 0 and block_n > 0 and block_k > 0, "Block sizes must be positive"
+    assert block_k % 4 == 0, "block_k must be a multiple of 4 for packed weights"
+
+    M, K = X_quant.shape
+    N, K_packed = packed_W.shape
+    expected_k_packed = (K + 3) // 4
+    assert expected_k_packed == K_packed, (
+        f"Weight K packing mismatch: X K={K}, expected packed K={expected_k_packed}, "
+        f"packed_W K_packed={K_packed}"
+    )
+
+    if row_scale.dim() == 2:
+        assert row_scale.shape == (M, 1), "2D row_scale must have shape (M, 1)"
+        row_scale = row_scale.reshape(M)
+    else:
+        assert row_scale.shape == (M,), "row_scale must have shape (M,) or (M, 1)"
+    row_scale = row_scale.contiguous()
+
+    Y = torch.empty((M, N), device=X_quant.device, dtype=torch.float32)
+    grid = lambda meta: (
+        triton.cdiv(M, meta['BLOCK_M']),
+        triton.cdiv(N, meta['BLOCK_N']),
+    )
+
+    _bitnet_packed_gemm_kernel[grid](
+        X_quant, packed_W, row_scale, Y,
+        M, N, K,
+        X_quant.stride(0), X_quant.stride(1),
+        packed_W.stride(0), packed_W.stride(1),
+        Y.stride(0), Y.stride(1),
+        BLOCK_M=block_m,
+        BLOCK_N=block_n,
+        BLOCK_K=block_k,
+        BLOCK_K_PACKED=block_k // 4,
+        num_warps=num_warps,
+        num_stages=num_stages,
+    )
+
     return Y
