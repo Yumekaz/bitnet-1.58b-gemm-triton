@@ -65,7 +65,7 @@ If `K` is not divisible by 4, packing pads the final byte with zero-weight lanes
   pre-unpacked-weight control kernel, and Python wrappers.
 - `benchmark.py`: CPU packing validation, GPU correctness checks, and benchmark
   chart generation. It reports the full fused kernel, a packed-GEMM-only path,
-  and a pre-unpacked-weight Triton control.
+  a same-input cuBLAS FP16 control, and a pre-unpacked-weight Triton control.
 - `tests/test_packing.py`: fast pytest coverage for packing invariants.
 
 ## Local CPU Validation
@@ -95,8 +95,8 @@ The script runs:
 1. CPU pack/unpack validation.
 2. GPU correctness checks for standard and padded `K` shapes.
 3. Latency benchmarks across sequence lengths for the PyTorch references, the
-   full fused Triton kernel, the packed-GEMM-only diagnostic path, and the
-   pre-unpacked-weight Triton control.
+   full fused Triton kernel, the packed-GEMM-only diagnostic path, a same-input
+   cuBLAS FP16 control, and the pre-unpacked-weight Triton control.
 4. A chart saved as `benchmark_results.png`.
 
 To sweep Triton tile and launch parameters on one representative shape:
@@ -176,9 +176,11 @@ Tesla T4 results with `N=4096, K=4096`:
 
 ## Next Engineering Targets
 
-- Add an optimized same-input dense control, such as cuBLAS/PyTorch fp16 GEMM
-  with pre-quantized activations, before attributing the control gap entirely to
-  weight compression.
+- Run the new same-input cuBLAS FP16 control on T4. It receives the same
+  pre-quantized FP16 activations and row dequantization scale as the packed
+  kernel, and uses FP32 output accumulation when the local PyTorch build
+  exposes `torch.mm(..., out_dtype=torch.float32)`. Activation preprocessing
+  and one-time weight conversion are excluded from both timed paths.
 - Optimize the packed-weight unpack layout without redundantly reloading packed
   bytes across logical weight lanes.
 - Replace the current `float16` `tl.dot` path with a true integer or ternary

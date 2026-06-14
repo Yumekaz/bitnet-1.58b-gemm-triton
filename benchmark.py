@@ -7,6 +7,7 @@ from bitnet_packing import pack_weights, unpack_weights_cpu
 
 CORRECTNESS_ATOL = 1e-1
 CORRECTNESS_RTOL = 1e-2
+_MM_SUPPORTS_OUT_DTYPE = None
 
 
 def kernel_config(block_m, block_n, block_k, num_warps=4, num_stages=3):
@@ -91,6 +92,28 @@ def quantized_reference(X: torch.Tensor, W: torch.Tensor, eps: float = 1e-5) -> 
     return (X_quant @ W.to(torch.float32).T) * row_scale[:, None]
 
 
+def same_input_cublas_reference(
+    X_quant_half: torch.Tensor,
+    W_fp16: torch.Tensor,
+    row_scale: torch.Tensor,
+) -> torch.Tensor:
+    """
+    Optimized dense control using the same pre-quantized activations and row
+    scale as the packed Triton GEMM. On CUDA, torch.mm dispatches to cuBLAS.
+    """
+    global _MM_SUPPORTS_OUT_DTYPE
+
+    if _MM_SUPPORTS_OUT_DTYPE is not False:
+        try:
+            gemm = torch.mm(X_quant_half, W_fp16.T, out_dtype=torch.float32)
+            _MM_SUPPORTS_OUT_DTYPE = True
+            return gemm * row_scale[:, None]
+        except TypeError:
+            _MM_SUPPORTS_OUT_DTYPE = False
+
+    return torch.mm(X_quant_half, W_fp16.T).to(torch.float32) * row_scale[:, None]
+
+
 def run_cpu_packing_validation():
     """
     Verifies CPU-side packing and unpacking, including non-multiple-of-4 K.
@@ -133,13 +156,16 @@ def run_correctness_test(M=128, N=1024, K=2048, eps=1e-5):
     X_quant_half = X_quant.to(torch.float16)
     Y_packed = bitnet_packed_gemm(X_quant_half, packed_W, row_scale)
     Y_unpacked = bitnet_unpacked_gemm(X_quant_half, W.to(torch.float16), row_scale)
+    Y_cublas = same_input_cublas_reference(X_quant_half, W.to(torch.float16), row_scale)
 
     is_close = torch.allclose(Y_triton, Y_ref, rtol=CORRECTNESS_RTOL, atol=CORRECTNESS_ATOL)
     packed_is_close = torch.allclose(Y_packed, Y_ref, rtol=CORRECTNESS_RTOL, atol=CORRECTNESS_ATOL)
     unpacked_is_close = torch.allclose(Y_unpacked, Y_ref, rtol=CORRECTNESS_RTOL, atol=CORRECTNESS_ATOL)
+    cublas_is_close = torch.allclose(Y_cublas, Y_ref, rtol=CORRECTNESS_RTOL, atol=CORRECTNESS_ATOL)
     max_diff = torch.max(torch.abs(Y_triton - Y_ref)).item()
     packed_max_diff = torch.max(torch.abs(Y_packed - Y_ref)).item()
     unpacked_max_diff = torch.max(torch.abs(Y_unpacked - Y_ref)).item()
+    cublas_max_diff = torch.max(torch.abs(Y_cublas - Y_ref)).item()
 
     if is_close:
         print(
@@ -174,7 +200,18 @@ def run_correctness_test(M=128, N=1024, K=2048, eps=1e-5):
             f"(Max diff: {unpacked_max_diff:.4e}, rtol={CORRECTNESS_RTOL}, atol={CORRECTNESS_ATOL})"
         )
 
-    return is_close and packed_is_close and unpacked_is_close
+    if cublas_is_close:
+        print(
+            f"Same-input cuBLAS control SUCCESS! "
+            f"(Max diff: {cublas_max_diff:.4e}, rtol={CORRECTNESS_RTOL}, atol={CORRECTNESS_ATOL})"
+        )
+    else:
+        print(
+            f"Same-input cuBLAS control FAILED! "
+            f"(Max diff: {cublas_max_diff:.4e}, rtol={CORRECTNESS_RTOL}, atol={CORRECTNESS_ATOL})"
+        )
+
+    return is_close and packed_is_close and unpacked_is_close and cublas_is_close
 
 
 def run_correctness_suite():
@@ -195,8 +232,9 @@ def run_benchmark(N=4096, K=4096):
       2. PyTorch quantized reference for the same math as the Triton kernel.
       3. torch.compile quantized reference when available.
       4. Packed Triton GEMM with pre-quantized activations.
-      5. Naive unpacked-weight Triton GEMM control.
-      6. Custom fused packed Triton kernel.
+      5. Same-input dense fp16 GEMM dispatched to cuBLAS by PyTorch.
+      6. Naive unpacked-weight Triton GEMM control.
+      7. Custom fused packed Triton kernel.
     """
     if not torch.cuda.is_available():
         print("\n" + "=" * 70)
@@ -220,6 +258,7 @@ def run_benchmark(N=4096, K=4096):
     latencies_quantized_ref = []
     latencies_compiled_quantized = []
     latencies_packed_gemm = []
+    latencies_cublas_gemm = []
     latencies_unpacked_gemm = []
     latencies_triton = []
 
@@ -248,6 +287,7 @@ def run_benchmark(N=4096, K=4096):
     Xq_warmup, scale_warmup = precompute_quantized_activations(X_warmup)
     Xq_warmup_half = Xq_warmup.to(torch.float16)
     bitnet_packed_gemm(Xq_warmup_half, packed_W, scale_warmup)
+    same_input_cublas_reference(Xq_warmup_half, W_fp16, scale_warmup)
     bitnet_unpacked_gemm(Xq_warmup_half, W_fp16, scale_warmup)
     bitnet_fused_gemm(X_warmup, packed_W)
     torch.cuda.synchronize()
@@ -260,6 +300,9 @@ def run_benchmark(N=4096, K=4096):
         ms_dense = triton.testing.do_bench(lambda: dense_fp16_reference(X))
         ms_quantized = triton.testing.do_bench(lambda: quantized_reference_for_bench(X))
         ms_packed = triton.testing.do_bench(lambda: bitnet_packed_gemm(X_quant_half, packed_W, row_scale))
+        ms_cublas = triton.testing.do_bench(
+            lambda: same_input_cublas_reference(X_quant_half, W_fp16, row_scale)
+        )
         ms_unpacked = triton.testing.do_bench(
             lambda: bitnet_unpacked_gemm(X_quant_half, W_fp16, row_scale)
         )
@@ -268,6 +311,7 @@ def run_benchmark(N=4096, K=4096):
         latencies_dense_fp16.append(ms_dense)
         latencies_quantized_ref.append(ms_quantized)
         latencies_packed_gemm.append(ms_packed)
+        latencies_cublas_gemm.append(ms_cublas)
         latencies_unpacked_gemm.append(ms_unpacked)
         latencies_triton.append(ms_triton)
 
@@ -282,9 +326,11 @@ def run_benchmark(N=4096, K=4096):
             f"M={M:4d} | Dense FP16: {ms_dense:6.3f} ms "
             f"| Quant Ref: {ms_quantized:6.3f} ms "
             f"| Packed GEMM: {ms_packed:6.3f} ms "
+            f"| Same-input cuBLAS: {ms_cublas:6.3f} ms "
             f"| Unpacked GEMM: {ms_unpacked:6.3f} ms "
             f"{compiled_msg} | Fused Triton: {ms_triton:6.3f} ms "
             f"| Fused/packed: {ms_triton / ms_packed:.2f}x "
+            f"| Packed/cuBLAS: {ms_packed / ms_cublas:.2f}x "
             f"| Packed speedup vs unpacked: {ms_unpacked / ms_packed:.2f}x "
             f"| Speedup vs Quant Ref: {ms_quantized / ms_triton:.2f}x"
         )
@@ -301,6 +347,13 @@ def run_benchmark(N=4096, K=4096):
             linewidth=2,
         )
     plt.plot(M_sizes, latencies_packed_gemm, label="Packed Triton GEMM only", marker="d", linewidth=2)
+    plt.plot(
+        M_sizes,
+        latencies_cublas_gemm,
+        label="Same-input cuBLAS FP16 GEMM",
+        marker="P",
+        linewidth=2,
+    )
     plt.plot(
         M_sizes,
         latencies_unpacked_gemm,
