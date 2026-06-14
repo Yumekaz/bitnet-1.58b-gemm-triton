@@ -41,12 +41,16 @@ KERNEL_CONFIGS = [
 if torch.cuda.is_available():
     from bitnet_kernel import (
         bitnet_fused_gemm,
+        bitnet_fused_gemm_wide,
         bitnet_packed_gemm,
+        bitnet_packed_gemm_wide,
         bitnet_unpacked_gemm,
     )
 else:
     bitnet_fused_gemm = None
+    bitnet_fused_gemm_wide = None
     bitnet_packed_gemm = None
+    bitnet_packed_gemm_wide = None
     bitnet_unpacked_gemm = None
 
 
@@ -157,15 +161,51 @@ def run_correctness_test(M=128, N=1024, K=2048, eps=1e-5):
     Y_packed = bitnet_packed_gemm(X_quant_half, packed_W, row_scale)
     Y_unpacked = bitnet_unpacked_gemm(X_quant_half, W.to(torch.float16), row_scale)
     Y_cublas = same_input_cublas_reference(X_quant_half, W.to(torch.float16), row_scale)
+    Y_packed_wide = None
+    Y_fused_wide = None
+    packed_wide_error = None
+    fused_wide_error = None
+
+    try:
+        Y_packed_wide = bitnet_packed_gemm_wide(X_quant_half, packed_W, row_scale)
+    except Exception as exc:
+        packed_wide_error = exc
+
+    try:
+        Y_fused_wide = bitnet_fused_gemm_wide(X, packed_W, eps=eps)
+    except Exception as exc:
+        fused_wide_error = exc
 
     is_close = torch.allclose(Y_triton, Y_ref, rtol=CORRECTNESS_RTOL, atol=CORRECTNESS_ATOL)
     packed_is_close = torch.allclose(Y_packed, Y_ref, rtol=CORRECTNESS_RTOL, atol=CORRECTNESS_ATOL)
     unpacked_is_close = torch.allclose(Y_unpacked, Y_ref, rtol=CORRECTNESS_RTOL, atol=CORRECTNESS_ATOL)
     cublas_is_close = torch.allclose(Y_cublas, Y_ref, rtol=CORRECTNESS_RTOL, atol=CORRECTNESS_ATOL)
+    packed_wide_is_close = False
+    fused_wide_is_close = False
     max_diff = torch.max(torch.abs(Y_triton - Y_ref)).item()
     packed_max_diff = torch.max(torch.abs(Y_packed - Y_ref)).item()
     unpacked_max_diff = torch.max(torch.abs(Y_unpacked - Y_ref)).item()
     cublas_max_diff = torch.max(torch.abs(Y_cublas - Y_ref)).item()
+    packed_wide_max_diff = None
+    fused_wide_max_diff = None
+
+    if Y_packed_wide is not None:
+        packed_wide_is_close = torch.allclose(
+            Y_packed_wide,
+            Y_ref,
+            rtol=CORRECTNESS_RTOL,
+            atol=CORRECTNESS_ATOL,
+        )
+        packed_wide_max_diff = torch.max(torch.abs(Y_packed_wide - Y_ref)).item()
+
+    if Y_fused_wide is not None:
+        fused_wide_is_close = torch.allclose(
+            Y_fused_wide,
+            Y_ref,
+            rtol=CORRECTNESS_RTOL,
+            atol=CORRECTNESS_ATOL,
+        )
+        fused_wide_max_diff = torch.max(torch.abs(Y_fused_wide - Y_ref)).item()
 
     if is_close:
         print(
@@ -211,6 +251,40 @@ def run_correctness_test(M=128, N=1024, K=2048, eps=1e-5):
             f"(Max diff: {cublas_max_diff:.4e}, rtol={CORRECTNESS_RTOL}, atol={CORRECTNESS_ATOL})"
         )
 
+    if packed_wide_error is not None:
+        print(
+            f"Wide-dot packed diagnostic SKIPPED! "
+            f"({type(packed_wide_error).__name__}: {packed_wide_error})"
+        )
+    else:
+        if packed_wide_is_close:
+            print(
+                f"Wide-dot packed diagnostic SUCCESS! "
+                f"(Max diff: {packed_wide_max_diff:.4e}, rtol={CORRECTNESS_RTOL}, atol={CORRECTNESS_ATOL})"
+            )
+        else:
+            print(
+                f"Wide-dot packed diagnostic FAILED! "
+                f"(Max diff: {packed_wide_max_diff:.4e}, rtol={CORRECTNESS_RTOL}, atol={CORRECTNESS_ATOL})"
+            )
+
+    if fused_wide_error is not None:
+        print(
+            f"Wide-dot fused experiment SKIPPED! "
+            f"({type(fused_wide_error).__name__}: {fused_wide_error})"
+        )
+    else:
+        if fused_wide_is_close:
+            print(
+                f"Wide-dot fused experiment SUCCESS! "
+                f"(Max diff: {fused_wide_max_diff:.4e}, rtol={CORRECTNESS_RTOL}, atol={CORRECTNESS_ATOL})"
+            )
+        else:
+            print(
+                f"Wide-dot fused experiment FAILED! "
+                f"(Max diff: {fused_wide_max_diff:.4e}, rtol={CORRECTNESS_RTOL}, atol={CORRECTNESS_ATOL})"
+            )
+
     return is_close and packed_is_close and unpacked_is_close and cublas_is_close
 
 
@@ -233,8 +307,10 @@ def run_benchmark(N=4096, K=4096):
       3. torch.compile quantized reference when available.
       4. Packed Triton GEMM with pre-quantized activations.
       5. Same-input dense fp16 GEMM dispatched to cuBLAS by PyTorch.
-      6. Naive unpacked-weight Triton GEMM control.
-      7. Custom fused packed Triton kernel.
+      6. Experimental wide-dot packed Triton GEMM when it compiles.
+      7. Naive unpacked-weight Triton GEMM control.
+      8. Custom fused packed Triton kernel.
+      9. Experimental wide-dot fused Triton kernel when it compiles.
     """
     if not torch.cuda.is_available():
         print("\n" + "=" * 70)
@@ -258,9 +334,11 @@ def run_benchmark(N=4096, K=4096):
     latencies_quantized_ref = []
     latencies_compiled_quantized = []
     latencies_packed_gemm = []
+    latencies_packed_wide_gemm = []
     latencies_cublas_gemm = []
     latencies_unpacked_gemm = []
     latencies_triton = []
+    latencies_triton_wide = []
 
     W_cpu = torch.randint(-1, 2, (N, K), dtype=torch.float32)
     W = W_cpu.to(device)
@@ -286,10 +364,40 @@ def run_benchmark(N=4096, K=4096):
         compiled_quantized_reference(X_warmup)
     Xq_warmup, scale_warmup = precompute_quantized_activations(X_warmup)
     Xq_warmup_half = Xq_warmup.to(torch.float16)
-    bitnet_packed_gemm(Xq_warmup_half, packed_W, scale_warmup)
+    Y_packed_warmup = bitnet_packed_gemm(Xq_warmup_half, packed_W, scale_warmup)
     same_input_cublas_reference(Xq_warmup_half, W_fp16, scale_warmup)
     bitnet_unpacked_gemm(Xq_warmup_half, W_fp16, scale_warmup)
-    bitnet_fused_gemm(X_warmup, packed_W)
+    Y_fused_warmup = bitnet_fused_gemm(X_warmup, packed_W)
+    packed_wide_available = True
+    fused_wide_available = True
+    try:
+        Y_packed_wide_warmup = bitnet_packed_gemm_wide(Xq_warmup_half, packed_W, scale_warmup)
+        if not torch.allclose(
+            Y_packed_wide_warmup,
+            Y_packed_warmup,
+            rtol=CORRECTNESS_RTOL,
+            atol=CORRECTNESS_ATOL,
+        ):
+            packed_wide_available = False
+            wide_diff = torch.max(torch.abs(Y_packed_wide_warmup - Y_packed_warmup)).item()
+            print(f"Wide-dot packed GEMM disabled after warmup correctness diff: {wide_diff:.4e}")
+    except Exception as exc:
+        packed_wide_available = False
+        print(f"Wide-dot packed GEMM disabled after warmup: {type(exc).__name__}: {exc}")
+    try:
+        Y_fused_wide_warmup = bitnet_fused_gemm_wide(X_warmup, packed_W)
+        if not torch.allclose(
+            Y_fused_wide_warmup,
+            Y_fused_warmup,
+            rtol=CORRECTNESS_RTOL,
+            atol=CORRECTNESS_ATOL,
+        ):
+            fused_wide_available = False
+            wide_diff = torch.max(torch.abs(Y_fused_wide_warmup - Y_fused_warmup)).item()
+            print(f"Wide-dot fused GEMM disabled after warmup correctness diff: {wide_diff:.4e}")
+    except Exception as exc:
+        fused_wide_available = False
+        print(f"Wide-dot fused GEMM disabled after warmup: {type(exc).__name__}: {exc}")
     torch.cuda.synchronize()
 
     for M in M_sizes:
@@ -303,17 +411,37 @@ def run_benchmark(N=4096, K=4096):
         ms_cublas = triton.testing.do_bench(
             lambda: same_input_cublas_reference(X_quant_half, W_fp16, row_scale)
         )
+        ms_packed_wide = None
+        if packed_wide_available:
+            try:
+                ms_packed_wide = triton.testing.do_bench(
+                    lambda: bitnet_packed_gemm_wide(X_quant_half, packed_W, row_scale)
+                )
+            except Exception as exc:
+                packed_wide_available = False
+                print(f"Wide-dot packed GEMM disabled at M={M}: {type(exc).__name__}: {exc}")
         ms_unpacked = triton.testing.do_bench(
             lambda: bitnet_unpacked_gemm(X_quant_half, W_fp16, row_scale)
         )
         ms_triton = triton.testing.do_bench(lambda: bitnet_fused_gemm(X, packed_W))
+        ms_triton_wide = None
+        if fused_wide_available:
+            try:
+                ms_triton_wide = triton.testing.do_bench(lambda: bitnet_fused_gemm_wide(X, packed_W))
+            except Exception as exc:
+                fused_wide_available = False
+                print(f"Wide-dot fused GEMM disabled at M={M}: {type(exc).__name__}: {exc}")
 
         latencies_dense_fp16.append(ms_dense)
         latencies_quantized_ref.append(ms_quantized)
         latencies_packed_gemm.append(ms_packed)
+        if ms_packed_wide is not None:
+            latencies_packed_wide_gemm.append(ms_packed_wide)
         latencies_cublas_gemm.append(ms_cublas)
         latencies_unpacked_gemm.append(ms_unpacked)
         latencies_triton.append(ms_triton)
+        if ms_triton_wide is not None:
+            latencies_triton_wide.append(ms_triton_wide)
 
         if compiled_quantized_reference is not None:
             ms_compiled = triton.testing.do_bench(lambda: compiled_quantized_reference(X))
@@ -321,14 +449,28 @@ def run_benchmark(N=4096, K=4096):
             compiled_msg = f" | Compiled Quant Ref: {ms_compiled:6.3f} ms"
         else:
             compiled_msg = ""
+        packed_wide_msg = ""
+        if ms_packed_wide is not None:
+            packed_wide_msg = (
+                f"| Wide Packed: {ms_packed_wide:6.3f} ms "
+                f"| Wide/legacy packed: {ms_packed_wide / ms_packed:.2f}x "
+            )
+        fused_wide_msg = ""
+        if ms_triton_wide is not None:
+            fused_wide_msg = (
+                f"| Wide Fused: {ms_triton_wide:6.3f} ms "
+                f"| Wide/legacy fused: {ms_triton_wide / ms_triton:.2f}x "
+            )
 
         print(
             f"M={M:4d} | Dense FP16: {ms_dense:6.3f} ms "
             f"| Quant Ref: {ms_quantized:6.3f} ms "
             f"| Packed GEMM: {ms_packed:6.3f} ms "
+            f"{packed_wide_msg}"
             f"| Same-input cuBLAS: {ms_cublas:6.3f} ms "
             f"| Unpacked GEMM: {ms_unpacked:6.3f} ms "
             f"{compiled_msg} | Fused Triton: {ms_triton:6.3f} ms "
+            f"{fused_wide_msg}"
             f"| Fused/packed: {ms_triton / ms_packed:.2f}x "
             f"| Packed slowdown vs cuBLAS: {ms_packed / ms_cublas:.2f}x "
             f"| Packed speedup vs unpacked: {ms_unpacked / ms_packed:.2f}x "
@@ -354,6 +496,14 @@ def run_benchmark(N=4096, K=4096):
         marker="P",
         linewidth=2,
     )
+    if len(latencies_packed_wide_gemm) == len(M_sizes):
+        plt.plot(
+            M_sizes,
+            latencies_packed_wide_gemm,
+            label="Wide-dot packed Triton GEMM",
+            marker="*",
+            linewidth=2,
+        )
     plt.plot(
         M_sizes,
         latencies_unpacked_gemm,
@@ -362,6 +512,8 @@ def run_benchmark(N=4096, K=4096):
         linewidth=2,
     )
     plt.plot(M_sizes, latencies_triton, label="Custom Fused Packed Triton", marker="x", linewidth=2)
+    if len(latencies_triton_wide) == len(M_sizes):
+        plt.plot(M_sizes, latencies_triton_wide, label="Wide-dot fused packed Triton", marker="h", linewidth=2)
     plt.xscale("log", base=2)
     plt.yscale("log")
     plt.xlabel("Token Sequence Length (M)", fontsize=12)

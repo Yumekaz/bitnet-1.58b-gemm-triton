@@ -62,7 +62,8 @@ If `K` is not divisible by 4, packing pads the final byte with zero-weight lanes
 - `bitnet_packing.py`: CPU/GPU PyTorch utility for packing ternary weights into
   2-bit byte storage and unpacking them for validation.
 - `bitnet_kernel.py`: fused Triton kernel, packed-GEMM diagnostic kernel,
-  pre-unpacked-weight control kernel, and Python wrappers.
+  experimental wide-dot packed kernels, pre-unpacked-weight control kernel, and
+  Python wrappers.
 - `benchmark.py`: CPU packing validation, GPU correctness checks, and benchmark
   chart generation. It reports the full fused kernel, a packed-GEMM-only path,
   a same-input cuBLAS FP16 control, and a pre-unpacked-weight Triton control.
@@ -96,7 +97,8 @@ The script runs:
 2. GPU correctness checks for standard and padded `K` shapes.
 3. Latency benchmarks across sequence lengths for the PyTorch references, the
    full fused Triton kernel, the packed-GEMM-only diagnostic path, a same-input
-   cuBLAS FP16 control, and the pre-unpacked-weight Triton control.
+   cuBLAS FP16 control, any compiling wide-dot packed experiment, and the
+   pre-unpacked-weight Triton control.
 4. A chart saved as `benchmark_results.png`.
 
 To sweep Triton tile and launch parameters on one representative shape:
@@ -196,6 +198,9 @@ chart from a fresh T4 run when publishing updated visuals.
 - Optimize the packed-weight GEMM path against the same-input cuBLAS control.
   This is now the main performance gap: the custom packed path is still much
   slower than optimized dense FP16 GEMM despite moving less weight data.
+- Validate the experimental wide-dot packed kernels. They trade duplicated
+  packed-byte loads for one larger `tl.dot` per K tile, and should only be
+  promoted if they compile, pass correctness, and improve T4 latency.
 - Optimize the packed-weight unpack layout without redundantly reloading packed
   bytes across logical weight lanes.
 - Replace the current `float16` `tl.dot` path with a true integer or ternary
