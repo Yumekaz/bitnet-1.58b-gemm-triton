@@ -8,6 +8,7 @@ from bitnet_packing import pack_weights, unpack_weights_cpu
 CORRECTNESS_ATOL = 1e-1
 CORRECTNESS_RTOL = 1e-2
 _MM_SUPPORTS_OUT_DTYPE = None
+ENABLE_WIDE_EXPERIMENTS = os.getenv("BITNET_WIDE", "0") == "1"
 
 
 def kernel_config(block_m, block_n, block_k, num_warps=4, num_stages=3):
@@ -166,15 +167,16 @@ def run_correctness_test(M=128, N=1024, K=2048, eps=1e-5):
     packed_wide_error = None
     fused_wide_error = None
 
-    try:
-        Y_packed_wide = bitnet_packed_gemm_wide(X_quant_half, packed_W, row_scale)
-    except Exception as exc:
-        packed_wide_error = exc
+    if ENABLE_WIDE_EXPERIMENTS:
+        try:
+            Y_packed_wide = bitnet_packed_gemm_wide(X_quant_half, packed_W, row_scale)
+        except Exception as exc:
+            packed_wide_error = exc
 
-    try:
-        Y_fused_wide = bitnet_fused_gemm_wide(X, packed_W, eps=eps)
-    except Exception as exc:
-        fused_wide_error = exc
+        try:
+            Y_fused_wide = bitnet_fused_gemm_wide(X, packed_W, eps=eps)
+        except Exception as exc:
+            fused_wide_error = exc
 
     is_close = torch.allclose(Y_triton, Y_ref, rtol=CORRECTNESS_RTOL, atol=CORRECTNESS_ATOL)
     packed_is_close = torch.allclose(Y_packed, Y_ref, rtol=CORRECTNESS_RTOL, atol=CORRECTNESS_ATOL)
@@ -251,7 +253,9 @@ def run_correctness_test(M=128, N=1024, K=2048, eps=1e-5):
             f"(Max diff: {cublas_max_diff:.4e}, rtol={CORRECTNESS_RTOL}, atol={CORRECTNESS_ATOL})"
         )
 
-    if packed_wide_error is not None:
+    if not ENABLE_WIDE_EXPERIMENTS:
+        print("Wide-dot experiments disabled. Set BITNET_WIDE=1 to reproduce them.")
+    elif packed_wide_error is not None:
         print(
             f"Wide-dot packed diagnostic SKIPPED! "
             f"({type(packed_wide_error).__name__}: {packed_wide_error})"
@@ -268,7 +272,9 @@ def run_correctness_test(M=128, N=1024, K=2048, eps=1e-5):
                 f"(Max diff: {packed_wide_max_diff:.4e}, rtol={CORRECTNESS_RTOL}, atol={CORRECTNESS_ATOL})"
             )
 
-    if fused_wide_error is not None:
+    if not ENABLE_WIDE_EXPERIMENTS:
+        pass
+    elif fused_wide_error is not None:
         print(
             f"Wide-dot fused experiment SKIPPED! "
             f"({type(fused_wide_error).__name__}: {fused_wide_error})"
@@ -307,10 +313,10 @@ def run_benchmark(N=4096, K=4096):
       3. torch.compile quantized reference when available.
       4. Packed Triton GEMM with pre-quantized activations.
       5. Same-input dense fp16 GEMM dispatched to cuBLAS by PyTorch.
-      6. Experimental wide-dot packed Triton GEMM when it compiles.
+      6. Optional experimental wide-dot packed Triton GEMM with BITNET_WIDE=1.
       7. Naive unpacked-weight Triton GEMM control.
       8. Custom fused packed Triton kernel.
-      9. Experimental wide-dot fused Triton kernel when it compiles.
+      9. Optional experimental wide-dot fused Triton kernel with BITNET_WIDE=1.
     """
     if not torch.cuda.is_available():
         print("\n" + "=" * 70)
@@ -368,36 +374,37 @@ def run_benchmark(N=4096, K=4096):
     same_input_cublas_reference(Xq_warmup_half, W_fp16, scale_warmup)
     bitnet_unpacked_gemm(Xq_warmup_half, W_fp16, scale_warmup)
     Y_fused_warmup = bitnet_fused_gemm(X_warmup, packed_W)
-    packed_wide_available = True
-    fused_wide_available = True
-    try:
-        Y_packed_wide_warmup = bitnet_packed_gemm_wide(Xq_warmup_half, packed_W, scale_warmup)
-        if not torch.allclose(
-            Y_packed_wide_warmup,
-            Y_packed_warmup,
-            rtol=CORRECTNESS_RTOL,
-            atol=CORRECTNESS_ATOL,
-        ):
+    packed_wide_available = ENABLE_WIDE_EXPERIMENTS
+    fused_wide_available = ENABLE_WIDE_EXPERIMENTS
+    if ENABLE_WIDE_EXPERIMENTS:
+        try:
+            Y_packed_wide_warmup = bitnet_packed_gemm_wide(Xq_warmup_half, packed_W, scale_warmup)
+            if not torch.allclose(
+                Y_packed_wide_warmup,
+                Y_packed_warmup,
+                rtol=CORRECTNESS_RTOL,
+                atol=CORRECTNESS_ATOL,
+            ):
+                packed_wide_available = False
+                wide_diff = torch.max(torch.abs(Y_packed_wide_warmup - Y_packed_warmup)).item()
+                print(f"Wide-dot packed GEMM disabled after warmup correctness diff: {wide_diff:.4e}")
+        except Exception as exc:
             packed_wide_available = False
-            wide_diff = torch.max(torch.abs(Y_packed_wide_warmup - Y_packed_warmup)).item()
-            print(f"Wide-dot packed GEMM disabled after warmup correctness diff: {wide_diff:.4e}")
-    except Exception as exc:
-        packed_wide_available = False
-        print(f"Wide-dot packed GEMM disabled after warmup: {type(exc).__name__}: {exc}")
-    try:
-        Y_fused_wide_warmup = bitnet_fused_gemm_wide(X_warmup, packed_W)
-        if not torch.allclose(
-            Y_fused_wide_warmup,
-            Y_fused_warmup,
-            rtol=CORRECTNESS_RTOL,
-            atol=CORRECTNESS_ATOL,
-        ):
+            print(f"Wide-dot packed GEMM disabled after warmup: {type(exc).__name__}: {exc}")
+        try:
+            Y_fused_wide_warmup = bitnet_fused_gemm_wide(X_warmup, packed_W)
+            if not torch.allclose(
+                Y_fused_wide_warmup,
+                Y_fused_warmup,
+                rtol=CORRECTNESS_RTOL,
+                atol=CORRECTNESS_ATOL,
+            ):
+                fused_wide_available = False
+                wide_diff = torch.max(torch.abs(Y_fused_wide_warmup - Y_fused_warmup)).item()
+                print(f"Wide-dot fused GEMM disabled after warmup correctness diff: {wide_diff:.4e}")
+        except Exception as exc:
             fused_wide_available = False
-            wide_diff = torch.max(torch.abs(Y_fused_wide_warmup - Y_fused_warmup)).item()
-            print(f"Wide-dot fused GEMM disabled after warmup correctness diff: {wide_diff:.4e}")
-    except Exception as exc:
-        fused_wide_available = False
-        print(f"Wide-dot fused GEMM disabled after warmup: {type(exc).__name__}: {exc}")
+            print(f"Wide-dot fused GEMM disabled after warmup: {type(exc).__name__}: {exc}")
     torch.cuda.synchronize()
 
     for M in M_sizes:

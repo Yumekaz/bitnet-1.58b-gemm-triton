@@ -97,9 +97,14 @@ The script runs:
 2. GPU correctness checks for standard and padded `K` shapes.
 3. Latency benchmarks across sequence lengths for the PyTorch references, the
    full fused Triton kernel, the packed-GEMM-only diagnostic path, a same-input
-   cuBLAS FP16 control, any compiling wide-dot packed experiment, and the
-   pre-unpacked-weight Triton control.
+   cuBLAS FP16 control, and the pre-unpacked-weight Triton control.
 4. A chart saved as `benchmark_results.png`.
+
+To reproduce the rejected wide-dot packed experiment:
+
+```bash
+BITNET_WIDE=1 PYTHONPATH=. python benchmark.py
+```
 
 To sweep Triton tile and launch parameters on one representative shape:
 
@@ -177,6 +182,22 @@ packed Triton GEMM is still 3.6x-13.8x slower than this cuBLAS control:
 | 1024 | 16.254 | 1.175 | 13.83x |
 | 2048 | 32.602 | 2.574 | 12.67x |
 
+The wide-dot packed experiment compiled and passed correctness, but was slower
+than the legacy packed kernel on T4. It trades four smaller dot products for one
+larger dot over an unpacked K tile, but the extra packed-byte reloads and wider
+temporary weight tile outweighed that benefit:
+
+| M | Legacy packed GEMM (ms) | Wide-dot packed GEMM (ms) | Wide/legacy |
+|---:|---:|---:|---:|
+| 16 | 0.636 | 4.514 | 7.10x |
+| 32 | 0.708 | 4.549 | 6.42x |
+| 64 | 1.257 | 10.037 | 7.98x |
+| 128 | 2.482 | 20.494 | 8.26x |
+| 256 | 4.374 | 42.254 | 9.66x |
+| 512 | 8.170 | 84.090 | 10.29x |
+| 1024 | 16.721 | 168.632 | 10.08x |
+| 2048 | 33.427 | 337.345 | 10.09x |
+
 Tesla T4 results with `N=4096, K=4096`:
 
 | M | Dense FP16 (ms) | Quant Ref (ms) | Same-input cuBLAS (ms) | Packed GEMM (ms) | Fused Triton (ms) | Fused/Packed |
@@ -198,9 +219,6 @@ chart from a fresh T4 run when publishing updated visuals.
 - Optimize the packed-weight GEMM path against the same-input cuBLAS control.
   This is now the main performance gap: the custom packed path is still much
   slower than optimized dense FP16 GEMM despite moving less weight data.
-- Validate the experimental wide-dot packed kernels. They trade duplicated
-  packed-byte loads for one larger `tl.dot` per K tile, and should only be
-  promoted if they compile, pass correctness, and improve T4 latency.
 - Optimize the packed-weight unpack layout without redundantly reloading packed
   bytes across logical weight lanes.
 - Replace the current `float16` `tl.dot` path with a true integer or ternary
