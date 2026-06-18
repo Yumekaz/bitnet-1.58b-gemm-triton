@@ -8,9 +8,22 @@ packing four ternary weights into one byte, loading the packed representation on
 GPU, unpacking with bit operations inside Triton, and combining the GEMM path
 with RMSNorm and dynamic activation quantization.
 
-The implementation is correctness-valid and useful as a systems prototype and
-benchmark study. It is not currently faster than optimized PyTorch/cuBLAS FP16
-GEMM.
+The implementation passes correctness checks and is intended as a systems
+prototype and benchmark study. It does not currently outperform optimized
+PyTorch/cuBLAS FP16 GEMM.
+
+## Scope
+
+This repository demonstrates:
+
+- compact 2-bit storage for ternary BitNet-style weights;
+- Triton-side packed-weight unpacking and accumulation;
+- fusion of RMSNorm and activation quantization into the GPU kernel path;
+- benchmark methodology for comparing custom packed kernels with fair dense
+  baselines.
+
+It does not claim a production-ready BitNet inference kernel or a speedup over
+cuBLAS.
 
 ## Highlights
 
@@ -21,7 +34,7 @@ GEMM.
   GEMM overhead.
 - Benchmarks against PyTorch quantized reference, `torch.compile`, same-input
   cuBLAS FP16 GEMM, and Triton control kernels.
-- Documents both successful and rejected optimization attempts.
+- Documents both positive results and negative optimization results.
 
 ## Current Status
 
@@ -32,7 +45,7 @@ GEMM.
 | Fused Triton correctness | Passing on Tesla T4 |
 | Packed GEMM vs naive unpacked Triton | Faster by 8.5x-14.6x |
 | Packed GEMM vs same-input cuBLAS FP16 | Slower by 3.6x-13.8x |
-| Wide-dot optimization attempt | Correct but slower, kept as optional experiment |
+| Wide-dot optimization experiment | Correct but slower, kept as optional experiment |
 
 ## Why This Exists
 
@@ -131,7 +144,7 @@ The benchmark runs:
    kernel.
 4. A chart saved as `benchmark_results.png`.
 
-To run the rejected wide-dot experiment:
+To reproduce the wide-dot experiment:
 
 ```bash
 BITNET_WIDE=1 PYTHONPATH=. python benchmark.py
@@ -213,7 +226,7 @@ The full fused kernel closely tracks the packed-GEMM-only diagnostic. This
 suggests the current bottleneck is the packed GEMM path itself, not RMSNorm or
 activation quantization overhead.
 
-## Rejected Optimization: Wide-Dot Packing
+## Optimization Experiment: Wide-Dot Packing
 
 An experimental wide-dot variant was tested. It expands packed weights across a
 full K tile and performs one larger `tl.dot`, instead of four smaller dot
